@@ -1,13 +1,18 @@
+use std::hash::BuildHasherDefault;
+use std::hash::Hash;
+use std::hash::Hasher;
+
 use hashbrown::hash_map::RawEntryMut;
 use rustc_hash::FxHasher;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
-
-use crate::{
-    GreenNode, GreenNodeData, GreenToken, GreenTokenData, NodeOrToken, SyntaxKind,
-    green::GreenElementRef,
-};
 
 use super::element::GreenElement;
+use crate::GreenNode;
+use crate::GreenNodeData;
+use crate::GreenToken;
+use crate::GreenTokenData;
+use crate::NodeOrToken;
+use crate::SyntaxKind;
+use crate::green::GreenElementRef;
 
 type HashMap<K, V> = hashbrown::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
@@ -35,123 +40,116 @@ struct NoHash<T>(T);
 // we don't accidentally use the wrong hash!
 #[derive(Default, Debug)]
 pub struct NodeCache {
-    nodes: HashMap<NoHash<GreenNode>, ()>,
-    tokens: HashMap<NoHash<GreenToken>, ()>,
+  nodes:  HashMap<NoHash<GreenNode>, ()>,
+  tokens: HashMap<NoHash<GreenToken>, ()>,
 }
 
 fn token_hash(token: &GreenTokenData) -> u64 {
-    let mut h = FxHasher::default();
-    token.kind().hash(&mut h);
-    token.text().hash(&mut h);
-    h.finish()
+  let mut h = FxHasher::default();
+  token.kind().hash(&mut h);
+  token.text().hash(&mut h);
+  h.finish()
 }
 
 fn node_hash(node: &GreenNodeData) -> u64 {
-    let mut h = FxHasher::default();
-    node.kind().hash(&mut h);
-    for child in node.children() {
-        match child {
-            NodeOrToken::Node(it) => node_hash(it),
-            NodeOrToken::Token(it) => token_hash(it),
-        }
-        .hash(&mut h)
+  let mut h = FxHasher::default();
+  node.kind().hash(&mut h);
+  for child in node.children() {
+    match child {
+      NodeOrToken::Node(it) => node_hash(it),
+      NodeOrToken::Token(it) => token_hash(it),
     }
-    h.finish()
+    .hash(&mut h)
+  }
+  h.finish()
 }
 
 fn element_id(elem: GreenElementRef<'_>) -> *const () {
-    match elem {
-        NodeOrToken::Node(it) => it as *const GreenNodeData as *const (),
-        NodeOrToken::Token(it) => it as *const GreenTokenData as *const (),
-    }
+  match elem {
+    NodeOrToken::Node(it) => it as *const GreenNodeData as *const (),
+    NodeOrToken::Token(it) => it as *const GreenTokenData as *const (),
+  }
 }
 
 impl NodeCache {
-    pub(crate) fn node(
-        &mut self,
-        kind: SyntaxKind,
-        children: &mut Vec<(u64, GreenElement)>,
-        first_child: usize,
-    ) -> (u64, GreenNode) {
-        let build_node = move |children: &mut Vec<(u64, GreenElement)>| {
-            GreenNode::new(kind, children.drain(first_child..).map(|(_, it)| it))
-        };
+  pub(crate) fn node(&mut self, kind: SyntaxKind, children: &mut Vec<(u64, GreenElement)>, first_child: usize) -> (u64, GreenNode) {
+    let build_node = move |children: &mut Vec<(u64, GreenElement)>| GreenNode::new(kind, children.drain(first_child..).map(|(_, it)| it));
 
-        let children_ref = &children[first_child..];
-        if children_ref.len() > 3 {
-            let node = build_node(children);
-            return (0, node);
+    let children_ref = &children[first_child..];
+    if children_ref.len() > 3 {
+      let node = build_node(children);
+      return (0, node);
+    }
+
+    let hash = {
+      let mut h = FxHasher::default();
+      kind.hash(&mut h);
+      for &(hash, _) in children_ref {
+        if hash == 0 {
+          let node = build_node(children);
+          return (0, node);
         }
+        hash.hash(&mut h);
+      }
+      h.finish()
+    };
 
-        let hash = {
-            let mut h = FxHasher::default();
-            kind.hash(&mut h);
-            for &(hash, _) in children_ref {
-                if hash == 0 {
-                    let node = build_node(children);
-                    return (0, node);
-                }
-                hash.hash(&mut h);
-            }
-            h.finish()
-        };
+    // Green nodes are fully immutable, so it's ok to deduplicate them.
+    // This is the same optimization that Roslyn does
+    // https://github.com/KirillOsenkov/Bliki/wiki/Roslyn-Immutable-Trees
+    //
+    // For example, all `#[inline]` in this file share the same green node!
+    // For `libsyntax/parse/parser.rs`, measurements show that deduping saves
+    // 17% of the memory for green nodes!
+    let entry = self.nodes.raw_entry_mut().from_hash(hash, |node| {
+      node.0.kind() == kind && node.0.children().len() == children_ref.len() && {
+        let lhs = node.0.children();
+        let rhs = children_ref.iter().map(|(_, it)| it.as_deref());
 
-        // Green nodes are fully immutable, so it's ok to deduplicate them.
-        // This is the same optimization that Roslyn does
-        // https://github.com/KirillOsenkov/Bliki/wiki/Roslyn-Immutable-Trees
-        //
-        // For example, all `#[inline]` in this file share the same green node!
-        // For `libsyntax/parse/parser.rs`, measurements show that deduping saves
-        // 17% of the memory for green nodes!
-        let entry = self.nodes.raw_entry_mut().from_hash(hash, |node| {
-            node.0.kind() == kind && node.0.children().len() == children_ref.len() && {
-                let lhs = node.0.children();
-                let rhs = children_ref.iter().map(|(_, it)| it.as_deref());
+        let lhs = lhs.map(element_id);
+        let rhs = rhs.map(element_id);
 
-                let lhs = lhs.map(element_id);
-                let rhs = rhs.map(element_id);
+        lhs.eq(rhs)
+      }
+    });
 
-                lhs.eq(rhs)
-            }
-        });
+    let node = match entry {
+      RawEntryMut::Occupied(entry) => {
+        drop(children.drain(first_child..));
+        entry.key().0.clone()
+      }
+      RawEntryMut::Vacant(entry) => {
+        let node = build_node(children);
+        entry.insert_with_hasher(hash, NoHash(node.clone()), (), |n| node_hash(&n.0));
+        node
+      }
+    };
 
-        let node = match entry {
-            RawEntryMut::Occupied(entry) => {
-                drop(children.drain(first_child..));
-                entry.key().0.clone()
-            }
-            RawEntryMut::Vacant(entry) => {
-                let node = build_node(children);
-                entry.insert_with_hasher(hash, NoHash(node.clone()), (), |n| node_hash(&n.0));
-                node
-            }
-        };
+    (hash, node)
+  }
 
-        (hash, node)
-    }
+  pub(crate) fn token(&mut self, kind: SyntaxKind, text: &str) -> (u64, GreenToken) {
+    let hash = {
+      let mut h = FxHasher::default();
+      kind.hash(&mut h);
+      text.hash(&mut h);
+      h.finish()
+    };
 
-    pub(crate) fn token(&mut self, kind: SyntaxKind, text: &str) -> (u64, GreenToken) {
-        let hash = {
-            let mut h = FxHasher::default();
-            kind.hash(&mut h);
-            text.hash(&mut h);
-            h.finish()
-        };
+    let entry = self
+      .tokens
+      .raw_entry_mut()
+      .from_hash(hash, |token| token.0.kind() == kind && token.0.text() == text);
 
-        let entry = self
-            .tokens
-            .raw_entry_mut()
-            .from_hash(hash, |token| token.0.kind() == kind && token.0.text() == text);
+    let token = match entry {
+      RawEntryMut::Occupied(entry) => entry.key().0.clone(),
+      RawEntryMut::Vacant(entry) => {
+        let token = GreenToken::new(kind, text);
+        entry.insert_with_hasher(hash, NoHash(token.clone()), (), |t| token_hash(&t.0));
+        token
+      }
+    };
 
-        let token = match entry {
-            RawEntryMut::Occupied(entry) => entry.key().0.clone(),
-            RawEntryMut::Vacant(entry) => {
-                let token = GreenToken::new(kind, text);
-                entry.insert_with_hasher(hash, NoHash(token.clone()), (), |t| token_hash(&t.0));
-                token
-            }
-        };
-
-        (hash, token)
-    }
+    (hash, token)
+  }
 }
