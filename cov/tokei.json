@@ -1,0 +1,1257 @@
+{
+  "Just": {
+    "blanks": 51,
+    "code": 83,
+    "comments": 101,
+    "reports": [
+      {
+        "stats": {
+          "blanks": 51,
+          "code": 83,
+          "comments": 101,
+          "blobs": {}
+        },
+        "name": "./justfile"
+      }
+    ],
+    "children": {},
+    "inaccurate": false
+  },
+  "Markdown": {
+    "blanks": 97,
+    "code": 0,
+    "comments": 144,
+    "reports": [
+      {
+        "stats": {
+          "blanks": 9,
+          "code": 0,
+          "comments": 14,
+          "blobs": {}
+        },
+        "name": "./README.md"
+      },
+      {
+        "stats": {
+          "blanks": 42,
+          "code": 0,
+          "comments": 53,
+          "blobs": {}
+        },
+        "name": "./xtask/AGENTS.md"
+      },
+      {
+        "stats": {
+          "blanks": 0,
+          "code": 0,
+          "comments": 1,
+          "blobs": {}
+        },
+        "name": "./xtask/CLAUDE.md"
+      },
+      {
+        "stats": {
+          "blanks": 21,
+          "code": 0,
+          "comments": 36,
+          "blobs": {}
+        },
+        "name": "./xtask/README.md"
+      },
+      {
+        "stats": {
+          "blanks": 25,
+          "code": 0,
+          "comments": 40,
+          "blobs": {
+            "BASH": {
+              "blanks": 0,
+              "code": 2,
+              "comments": 0,
+              "blobs": {}
+            },
+            "Rust": {
+              "blanks": 14,
+              "code": 98,
+              "comments": 0,
+              "blobs": {
+                "Markdown": {
+                  "blanks": 6,
+                  "code": 0,
+                  "comments": 18,
+                  "blobs": {}
+                }
+              }
+            },
+            "TOML": {
+              "blanks": 0,
+              "code": 5,
+              "comments": 0,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./xtask/example-command.md"
+      }
+    ],
+    "children": {
+      "BASH": [
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 2,
+            "comments": 0,
+            "blobs": {}
+          },
+          "name": "./xtask/example-command.md"
+        }
+      ],
+      "Rust": [
+        {
+          "stats": {
+            "blanks": 14,
+            "code": 98,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 6,
+                "code": 0,
+                "comments": 18,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./xtask/example-command.md"
+        }
+      ],
+      "TOML": [
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 5,
+            "comments": 0,
+            "blobs": {}
+          },
+          "name": "./xtask/example-command.md"
+        }
+      ]
+    },
+    "inaccurate": false
+  },
+  "Rust": {
+    "blanks": 721,
+    "code": 4848,
+    "comments": 205,
+    "reports": [
+      {
+        "stats": {
+          "blanks": 30,
+          "code": 261,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 14,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./examples/math.rs"
+      },
+      {
+        "stats": {
+          "blanks": 54,
+          "code": 451,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 4,
+              "code": 0,
+              "comments": 57,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./examples/s_expressions.rs"
+      },
+      {
+        "stats": {
+          "blanks": 87,
+          "code": 454,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 2,
+              "code": 0,
+              "comments": 29,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/api.rs"
+      },
+      {
+        "stats": {
+          "blanks": 59,
+          "code": 297,
+          "comments": 75,
+          "blobs": {
+            "Markdown": {
+              "blanks": 9,
+              "code": 0,
+              "comments": 36,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/arc.rs"
+      },
+      {
+        "stats": {
+          "blanks": 44,
+          "code": 206,
+          "comments": 5,
+          "blobs": {
+            "Markdown": {
+              "blanks": 11,
+              "code": 0,
+              "comments": 49,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/ast.rs"
+      },
+      {
+        "stats": {
+          "blanks": 3,
+          "code": 27,
+          "comments": 0,
+          "blobs": {}
+        },
+        "name": "./src/cow_mut.rs"
+      },
+      {
+        "stats": {
+          "blanks": 197,
+          "code": 1420,
+          "comments": 86,
+          "blobs": {
+            "Markdown": {
+              "blanks": 3,
+              "code": 0,
+              "comments": 16,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/cursor.rs"
+      },
+      {
+        "stats": {
+          "blanks": 6,
+          "code": 36,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 1,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/green.rs"
+      },
+      {
+        "stats": {
+          "blanks": 15,
+          "code": 78,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 21,
+              "blobs": {
+                "Rust": {
+                  "blanks": 0,
+                  "code": 17,
+                  "comments": 1,
+                  "blobs": {}
+                }
+              }
+            }
+          }
+        },
+        "name": "./src/green/builder.rs"
+      },
+      {
+        "stats": {
+          "blanks": 12,
+          "code": 74,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 4,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/green/element.rs"
+      },
+      {
+        "stats": {
+          "blanks": 48,
+          "code": 352,
+          "comments": 5,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 6,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/green/node.rs"
+      },
+      {
+        "stats": {
+          "blanks": 30,
+          "code": 231,
+          "comments": 23,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 1,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/green/node_cache.rs"
+      },
+      {
+        "stats": {
+          "blanks": 20,
+          "code": 129,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 3,
+              "code": 0,
+              "comments": 13,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/green/token.rs"
+      },
+      {
+        "stats": {
+          "blanks": 5,
+          "code": 43,
+          "comments": 2,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 2,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/lib.rs"
+      },
+      {
+        "stats": {
+          "blanks": 8,
+          "code": 62,
+          "comments": 0,
+          "blobs": {}
+        },
+        "name": "./src/serde_impls.rs"
+      },
+      {
+        "stats": {
+          "blanks": 17,
+          "code": 103,
+          "comments": 7,
+          "blobs": {
+            "Markdown": {
+              "blanks": 2,
+              "code": 0,
+              "comments": 7,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/sll.rs"
+      },
+      {
+        "stats": {
+          "blanks": 39,
+          "code": 325,
+          "comments": 0,
+          "blobs": {}
+        },
+        "name": "./src/syntax_text.rs"
+      },
+      {
+        "stats": {
+          "blanks": 21,
+          "code": 140,
+          "comments": 2,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 9,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./src/utility_types.rs"
+      },
+      {
+        "stats": {
+          "blanks": 9,
+          "code": 87,
+          "comments": 0,
+          "blobs": {}
+        },
+        "name": "./tests/serde.rs"
+      },
+      {
+        "stats": {
+          "blanks": 2,
+          "code": 14,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 2,
+              "code": 0,
+              "comments": 4,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./xtask/src/extensions.rs"
+      },
+      {
+        "stats": {
+          "blanks": 11,
+          "code": 50,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 1,
+              "code": 0,
+              "comments": 9,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./xtask/src/lib.rs"
+      },
+      {
+        "stats": {
+          "blanks": 2,
+          "code": 4,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 2,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./xtask/src/main.rs"
+      },
+      {
+        "stats": {
+          "blanks": 2,
+          "code": 4,
+          "comments": 0,
+          "blobs": {
+            "Markdown": {
+              "blanks": 0,
+              "code": 0,
+              "comments": 2,
+              "blobs": {}
+            }
+          }
+        },
+        "name": "./xtask/src/precommit_hook.rs"
+      }
+    ],
+    "children": {
+      "Markdown": [
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 14,
+            "blobs": {}
+          },
+          "name": "./examples/math.rs"
+        },
+        {
+          "stats": {
+            "blanks": 4,
+            "code": 0,
+            "comments": 57,
+            "blobs": {}
+          },
+          "name": "./examples/s_expressions.rs"
+        },
+        {
+          "stats": {
+            "blanks": 2,
+            "code": 0,
+            "comments": 29,
+            "blobs": {}
+          },
+          "name": "./src/api.rs"
+        },
+        {
+          "stats": {
+            "blanks": 9,
+            "code": 0,
+            "comments": 36,
+            "blobs": {}
+          },
+          "name": "./src/arc.rs"
+        },
+        {
+          "stats": {
+            "blanks": 11,
+            "code": 0,
+            "comments": 49,
+            "blobs": {}
+          },
+          "name": "./src/ast.rs"
+        },
+        {
+          "stats": {
+            "blanks": 3,
+            "code": 0,
+            "comments": 16,
+            "blobs": {}
+          },
+          "name": "./src/cursor.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 1,
+            "blobs": {}
+          },
+          "name": "./src/green.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 21,
+            "blobs": {
+              "Rust": {
+                "blanks": 0,
+                "code": 17,
+                "comments": 1,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/green/builder.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 4,
+            "blobs": {}
+          },
+          "name": "./src/green/element.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 6,
+            "blobs": {}
+          },
+          "name": "./src/green/node.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 1,
+            "blobs": {}
+          },
+          "name": "./src/green/node_cache.rs"
+        },
+        {
+          "stats": {
+            "blanks": 3,
+            "code": 0,
+            "comments": 13,
+            "blobs": {}
+          },
+          "name": "./src/green/token.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 2,
+            "blobs": {}
+          },
+          "name": "./src/lib.rs"
+        },
+        {
+          "stats": {
+            "blanks": 2,
+            "code": 0,
+            "comments": 7,
+            "blobs": {}
+          },
+          "name": "./src/sll.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 9,
+            "blobs": {}
+          },
+          "name": "./src/utility_types.rs"
+        },
+        {
+          "stats": {
+            "blanks": 2,
+            "code": 0,
+            "comments": 4,
+            "blobs": {}
+          },
+          "name": "./xtask/src/extensions.rs"
+        },
+        {
+          "stats": {
+            "blanks": 1,
+            "code": 0,
+            "comments": 9,
+            "blobs": {}
+          },
+          "name": "./xtask/src/lib.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 2,
+            "blobs": {}
+          },
+          "name": "./xtask/src/main.rs"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 2,
+            "blobs": {}
+          },
+          "name": "./xtask/src/precommit_hook.rs"
+        }
+      ]
+    },
+    "inaccurate": false
+  },
+  "TOML": {
+    "blanks": 231,
+    "code": 878,
+    "comments": 93,
+    "reports": [
+      {
+        "stats": {
+          "blanks": 212,
+          "code": 741,
+          "comments": 43,
+          "blobs": {}
+        },
+        "name": "./Cargo.toml"
+      },
+      {
+        "stats": {
+          "blanks": 0,
+          "code": 2,
+          "comments": 0,
+          "blobs": {}
+        },
+        "name": "./bors.toml"
+      },
+      {
+        "stats": {
+          "blanks": 5,
+          "code": 41,
+          "comments": 13,
+          "blobs": {}
+        },
+        "name": "./deny.toml"
+      },
+      {
+        "stats": {
+          "blanks": 3,
+          "code": 10,
+          "comments": 16,
+          "blobs": {}
+        },
+        "name": "./dupes.toml"
+      },
+      {
+        "stats": {
+          "blanks": 0,
+          "code": 4,
+          "comments": 4,
+          "blobs": {}
+        },
+        "name": "./rust-toolchain.toml"
+      },
+      {
+        "stats": {
+          "blanks": 5,
+          "code": 53,
+          "comments": 14,
+          "blobs": {}
+        },
+        "name": "./rustfmt.toml"
+      },
+      {
+        "stats": {
+          "blanks": 6,
+          "code": 27,
+          "comments": 3,
+          "blobs": {}
+        },
+        "name": "./xtask/Cargo.toml"
+      }
+    ],
+    "children": {},
+    "inaccurate": false
+  },
+  "Total": {
+    "blanks": 1157,
+    "code": 5931,
+    "comments": 844,
+    "reports": [],
+    "children": {
+      "Just": [
+        {
+          "stats": {
+            "blanks": 51,
+            "code": 83,
+            "comments": 101,
+            "blobs": {}
+          },
+          "name": "./justfile"
+        }
+      ],
+      "Markdown": [
+        {
+          "stats": {
+            "blanks": 9,
+            "code": 0,
+            "comments": 14,
+            "blobs": {}
+          },
+          "name": "./README.md"
+        },
+        {
+          "stats": {
+            "blanks": 42,
+            "code": 0,
+            "comments": 53,
+            "blobs": {}
+          },
+          "name": "./xtask/AGENTS.md"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 0,
+            "comments": 1,
+            "blobs": {}
+          },
+          "name": "./xtask/CLAUDE.md"
+        },
+        {
+          "stats": {
+            "blanks": 21,
+            "code": 0,
+            "comments": 36,
+            "blobs": {}
+          },
+          "name": "./xtask/README.md"
+        },
+        {
+          "stats": {
+            "blanks": 25,
+            "code": 0,
+            "comments": 40,
+            "blobs": {
+              "BASH": {
+                "blanks": 0,
+                "code": 2,
+                "comments": 0,
+                "blobs": {}
+              },
+              "Rust": {
+                "blanks": 14,
+                "code": 98,
+                "comments": 0,
+                "blobs": {
+                  "Markdown": {
+                    "blanks": 6,
+                    "code": 0,
+                    "comments": 18,
+                    "blobs": {}
+                  }
+                }
+              },
+              "TOML": {
+                "blanks": 0,
+                "code": 5,
+                "comments": 0,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./xtask/example-command.md"
+        }
+      ],
+      "Rust": [
+        {
+          "stats": {
+            "blanks": 30,
+            "code": 261,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 14,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./examples/math.rs"
+        },
+        {
+          "stats": {
+            "blanks": 54,
+            "code": 451,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 4,
+                "code": 0,
+                "comments": 57,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./examples/s_expressions.rs"
+        },
+        {
+          "stats": {
+            "blanks": 87,
+            "code": 454,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 2,
+                "code": 0,
+                "comments": 29,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/api.rs"
+        },
+        {
+          "stats": {
+            "blanks": 59,
+            "code": 297,
+            "comments": 75,
+            "blobs": {
+              "Markdown": {
+                "blanks": 9,
+                "code": 0,
+                "comments": 36,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/arc.rs"
+        },
+        {
+          "stats": {
+            "blanks": 44,
+            "code": 206,
+            "comments": 5,
+            "blobs": {
+              "Markdown": {
+                "blanks": 11,
+                "code": 0,
+                "comments": 49,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/ast.rs"
+        },
+        {
+          "stats": {
+            "blanks": 3,
+            "code": 27,
+            "comments": 0,
+            "blobs": {}
+          },
+          "name": "./src/cow_mut.rs"
+        },
+        {
+          "stats": {
+            "blanks": 197,
+            "code": 1420,
+            "comments": 86,
+            "blobs": {
+              "Markdown": {
+                "blanks": 3,
+                "code": 0,
+                "comments": 16,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/cursor.rs"
+        },
+        {
+          "stats": {
+            "blanks": 6,
+            "code": 36,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 1,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/green.rs"
+        },
+        {
+          "stats": {
+            "blanks": 15,
+            "code": 78,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 21,
+                "blobs": {
+                  "Rust": {
+                    "blanks": 0,
+                    "code": 17,
+                    "comments": 1,
+                    "blobs": {}
+                  }
+                }
+              }
+            }
+          },
+          "name": "./src/green/builder.rs"
+        },
+        {
+          "stats": {
+            "blanks": 12,
+            "code": 74,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 4,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/green/element.rs"
+        },
+        {
+          "stats": {
+            "blanks": 48,
+            "code": 352,
+            "comments": 5,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 6,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/green/node.rs"
+        },
+        {
+          "stats": {
+            "blanks": 30,
+            "code": 231,
+            "comments": 23,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 1,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/green/node_cache.rs"
+        },
+        {
+          "stats": {
+            "blanks": 20,
+            "code": 129,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 3,
+                "code": 0,
+                "comments": 13,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/green/token.rs"
+        },
+        {
+          "stats": {
+            "blanks": 5,
+            "code": 43,
+            "comments": 2,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 2,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/lib.rs"
+        },
+        {
+          "stats": {
+            "blanks": 8,
+            "code": 62,
+            "comments": 0,
+            "blobs": {}
+          },
+          "name": "./src/serde_impls.rs"
+        },
+        {
+          "stats": {
+            "blanks": 17,
+            "code": 103,
+            "comments": 7,
+            "blobs": {
+              "Markdown": {
+                "blanks": 2,
+                "code": 0,
+                "comments": 7,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/sll.rs"
+        },
+        {
+          "stats": {
+            "blanks": 39,
+            "code": 325,
+            "comments": 0,
+            "blobs": {}
+          },
+          "name": "./src/syntax_text.rs"
+        },
+        {
+          "stats": {
+            "blanks": 21,
+            "code": 140,
+            "comments": 2,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 9,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./src/utility_types.rs"
+        },
+        {
+          "stats": {
+            "blanks": 9,
+            "code": 87,
+            "comments": 0,
+            "blobs": {}
+          },
+          "name": "./tests/serde.rs"
+        },
+        {
+          "stats": {
+            "blanks": 2,
+            "code": 14,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 2,
+                "code": 0,
+                "comments": 4,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./xtask/src/extensions.rs"
+        },
+        {
+          "stats": {
+            "blanks": 11,
+            "code": 50,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 1,
+                "code": 0,
+                "comments": 9,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./xtask/src/lib.rs"
+        },
+        {
+          "stats": {
+            "blanks": 2,
+            "code": 4,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 2,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./xtask/src/main.rs"
+        },
+        {
+          "stats": {
+            "blanks": 2,
+            "code": 4,
+            "comments": 0,
+            "blobs": {
+              "Markdown": {
+                "blanks": 0,
+                "code": 0,
+                "comments": 2,
+                "blobs": {}
+              }
+            }
+          },
+          "name": "./xtask/src/precommit_hook.rs"
+        }
+      ],
+      "TOML": [
+        {
+          "stats": {
+            "blanks": 212,
+            "code": 741,
+            "comments": 43,
+            "blobs": {}
+          },
+          "name": "./Cargo.toml"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 2,
+            "comments": 0,
+            "blobs": {}
+          },
+          "name": "./bors.toml"
+        },
+        {
+          "stats": {
+            "blanks": 5,
+            "code": 41,
+            "comments": 13,
+            "blobs": {}
+          },
+          "name": "./deny.toml"
+        },
+        {
+          "stats": {
+            "blanks": 3,
+            "code": 10,
+            "comments": 16,
+            "blobs": {}
+          },
+          "name": "./dupes.toml"
+        },
+        {
+          "stats": {
+            "blanks": 0,
+            "code": 4,
+            "comments": 4,
+            "blobs": {}
+          },
+          "name": "./rust-toolchain.toml"
+        },
+        {
+          "stats": {
+            "blanks": 5,
+            "code": 53,
+            "comments": 14,
+            "blobs": {}
+          },
+          "name": "./rustfmt.toml"
+        },
+        {
+          "stats": {
+            "blanks": 6,
+            "code": 27,
+            "comments": 3,
+            "blobs": {}
+          },
+          "name": "./xtask/Cargo.toml"
+        }
+      ]
+    },
+    "inaccurate": false
+  }
+}

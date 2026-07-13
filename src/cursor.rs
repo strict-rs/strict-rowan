@@ -350,7 +350,7 @@ impl NodeData {
     }
   }
   #[inline]
-  fn green_siblings(&self) -> slice::Iter<GreenChild> {
+  fn green_siblings(&self) -> slice::Iter<'_, GreenChild> {
     match &self.parent().map(|it| &it.green) {
       Some(Green::Node {
         ptr,
@@ -962,15 +962,16 @@ impl SyntaxNode {
 
   pub fn splice_children<I: IntoIterator<Item = SyntaxElement>>(&self, to_delete: Range<usize>, to_insert: I) {
     assert!(self.data().mutable, "immutable tree: {}", self);
-    for (i, child) in self.children_with_tokens().enumerate() {
-      if to_delete.contains(&i) {
-        child.detach();
-      }
+    let children_to_detach = self
+      .children_with_tokens()
+      .enumerate()
+      .filter_map(|(index, child)| to_delete.contains(&index).then_some(child))
+      .collect::<Vec<_>>();
+    for child in children_to_detach {
+      child.detach();
     }
-    let mut index = to_delete.start;
-    for child in to_insert {
+    for (index, child) in (to_delete.start..).zip(to_insert) {
       self.attach_child(index, child);
-      index += 1;
     }
   }
 
@@ -1615,3 +1616,107 @@ impl Iterator for PreorderWithTokens {
   }
 }
 // endregion
+
+#[cfg(test)]
+mod tests {
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_some;
+
+  use super::SyntaxElement;
+  use super::SyntaxNode;
+  use super::SyntaxToken;
+  use crate::GreenNode;
+  use crate::GreenToken;
+  use crate::NodeOrToken;
+  use crate::SyntaxKind;
+
+  fn mutable_token_root(texts: &[&str]) -> SyntaxNode {
+    let children = texts.iter().map(|text| GreenToken::new(SyntaxKind(1), text).into());
+    SyntaxNode::new_root_mut(GreenNode::new(SyntaxKind(0), children))
+  }
+
+  fn next_token(children: &mut impl Iterator<Item = SyntaxElement>, context: &'static str) -> Result<SyntaxToken, TestFailure> {
+    ensure_some(children.next().and_then(NodeOrToken::into_token), context)
+  }
+
+  fn child_texts(root: &SyntaxNode) -> String {
+    root
+      .children_with_tokens()
+      .map(|child| match child {
+        NodeOrToken::Node(node) => node.to_string(),
+        NodeOrToken::Token(token) => token.text().to_owned(),
+      })
+      .collect::<Vec<_>>()
+      .join("|")
+  }
+
+  #[test]
+  fn splice_children_reparents_insertions_and_reindexes_live_siblings() -> Result<(), TestFailure> {
+    let root = mutable_token_root(&["a", "b", "c"]);
+    let mut original_children = root.children_with_tokens();
+    let _a = next_token(&mut original_children, "the original root must contain token a")?;
+    let b = next_token(&mut original_children, "the original root must contain token b")?;
+    let c = next_token(&mut original_children, "the original root must contain token c")?;
+
+    let detached_root = mutable_token_root(&["x", "y"]);
+    let mut detached_children = detached_root.children_with_tokens();
+    let x = next_token(&mut detached_children, "the insertion root must contain token x")?;
+    let y = next_token(&mut detached_children, "the insertion root must contain token y")?;
+
+    root.splice_children(1..2, [x.clone().into(), y.clone().into()]);
+
+    ensure_eq(
+      &root.to_string(),
+      &"axyc".to_owned(),
+      "replacement text must preserve insertion order",
+    )?;
+    ensure(b.parent().is_none(), "the replaced token must be detached")?;
+    ensure(
+      ensure_some(x.parent(), "inserted token x must have a parent")? == root,
+      "inserted token x must be parented by the original root",
+    )?;
+    ensure(
+      ensure_some(y.parent(), "inserted token y must have a parent")? == root,
+      "inserted token y must be parented by the original root",
+    )?;
+    ensure_eq(&x.index(), &1, "inserted token x must occupy index one")?;
+    ensure_eq(&y.index(), &2, "inserted token y must occupy index two")?;
+    ensure(
+      ensure_some(c.parent(), "the live trailing token must remain attached")? == root,
+      "the live trailing token must remain parented by the original root",
+    )?;
+    ensure_eq(&c.index(), &3, "the live trailing token must be reindexed")?;
+    ensure_eq(
+      &child_texts(&root),
+      &"a|x|y|c".to_owned(),
+      "children_with_tokens must expose the replacement source order",
+    )
+  }
+
+  #[test]
+  fn splice_children_detaches_deleted_children_without_replacement() -> Result<(), TestFailure> {
+    let root = mutable_token_root(&["a", "b", "c"]);
+    let mut children = root.children_with_tokens();
+    let a = next_token(&mut children, "the root must contain token a")?;
+    let b = next_token(&mut children, "the root must contain token b")?;
+    let c = next_token(&mut children, "the root must contain token c")?;
+
+    root.splice_children(1..3, std::iter::empty::<SyntaxElement>());
+
+    ensure_eq(&root.to_string(), &"a".to_owned(), "deletion must retain only the unaffected token")?;
+    ensure(b.parent().is_none(), "the first deleted token must be detached")?;
+    ensure(c.parent().is_none(), "the second deleted token must be detached")?;
+    ensure(
+      ensure_some(a.parent(), "the unaffected token must remain attached")? == root,
+      "the unaffected token must remain parented by the original root",
+    )?;
+    ensure_eq(&a.index(), &0, "the unaffected token must remain at index zero")?;
+    ensure_eq(
+      &child_texts(&root),
+      &"a".to_owned(),
+      "deletion without replacement must not create phantom children",
+    )
+  }
+}
