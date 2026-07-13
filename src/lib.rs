@@ -21,7 +21,7 @@ mod utility_types;
 mod arc;
 pub mod ast;
 mod cow_mut;
-#[cfg(feature = "serde1")]
+#[cfg(feature = "serde")]
 mod serde_impls;
 #[allow(unsafe_code)]
 mod sll;

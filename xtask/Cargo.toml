@@ -31,8 +31,6 @@ agents-md.workspace = true
 strict-xtask-agents-md.workspace = true
 strict-xtask-cargo.workspace = true
 strict-xtask-core.workspace = true
-anyhow = "1.0.103"
-xshell = "0.2.7"
 
 [dev-dependencies]
 strict-test-support = { workspace = true }

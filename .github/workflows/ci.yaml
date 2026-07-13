@@ -1,8 +1,12 @@
 name: CI
+
 on:
   pull_request:
   push:
     branches: ["master", "staging", "trying"]
+
+permissions:
+  contents: read
 
 env:
   CARGO_INCREMENTAL: 0
@@ -10,23 +14,40 @@ env:
   CI: 1
   RUST_BACKTRACE: short
   RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  test:
-    name: Rust
+  stage1:
+    name: Stage 1
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 0 # fetch tags for publish
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        profile: minimal
-        override: true
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
 
-    - run: cargo run -p xtask -- ci
-      env:
-        CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      - name: Format
+        run: cargo +nightly fmt --all -- --check
+      - name: Check without optional features
+        run: cargo check --workspace --all-targets --no-default-features
+      - name: Check all features
+        run: cargo check --workspace --all-targets --all-features
+      - name: Clippy without optional features
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - name: Clippy all features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test without optional features
+        run: cargo test --workspace --all-targets --no-default-features
+      - name: Test all features
+        run: cargo test --workspace --all-targets --all-features
+      - name: Test release
+        run: cargo test --workspace --all-targets --all-features --release
+      - name: Doctests
+        run: cargo test --workspace --doc --all-features
+      - name: Documentation
+        run: cargo doc --workspace --no-deps --all-features

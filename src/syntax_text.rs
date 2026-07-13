@@ -126,10 +126,7 @@ impl SyntaxText {
 }
 
 fn found<T>(res: Result<(), T>) -> Option<T> {
-  match res {
-    Ok(()) => None,
-    Err(it) => Some(it),
-  }
+  res.err()
 }
 
 impl fmt::Debug for SyntaxText {
@@ -276,6 +273,11 @@ mod private {
 
 #[cfg(test)]
 mod tests {
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_some;
+
   use super::*;
   use crate::GreenNodeBuilder;
   use crate::green::SyntaxKind;
@@ -317,5 +319,46 @@ mod tests {
     check(&["{", "abc", "}", "{"], &["{", "123", "}"]);
     check(&["{", "abc", "}"], &["{", "123", "}", "{"]);
     check(&["{", "abc", "}ab"], &["{", "abc", "}", "ab"]);
+  }
+
+  #[test]
+  fn character_queries_distinguish_matches_boundaries_and_absence() -> Result<(), TestFailure> {
+    let text = build_tree(&["ab", "β", "cd"]).text();
+
+    ensure_eq(
+      &u32::from(ensure_some(text.find_char('a'), "the first chunk must contain a")?),
+      &0,
+      "a must begin at byte offset zero",
+    )?;
+    ensure_eq(
+      &u32::from(ensure_some(text.find_char('β'), "the middle chunk must contain beta")?),
+      &2,
+      "beta must begin at byte offset two",
+    )?;
+    ensure_eq(
+      &u32::from(ensure_some(text.find_char('d'), "the final chunk must contain d")?),
+      &5,
+      "d must begin at byte offset five",
+    )?;
+    ensure(text.find_char('z').is_none(), "an absent character must not produce an offset")?;
+    ensure_eq(
+      &ensure_some(text.char_at(TextSize::from(0)), "offset zero must contain a character")?,
+      &'a',
+      "offset zero must contain a",
+    )?;
+    ensure_eq(
+      &ensure_some(text.char_at(TextSize::from(2)), "offset two must contain a character")?,
+      &'β',
+      "offset two must contain beta",
+    )?;
+    ensure_eq(
+      &ensure_some(text.char_at(TextSize::from(4)), "offset four must contain a character")?,
+      &'c',
+      "offset four must contain c",
+    )?;
+    ensure(
+      text.char_at(TextSize::from(6)).is_none(),
+      "the end offset must not contain a character",
+    )
   }
 }
