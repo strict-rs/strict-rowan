@@ -1,10 +1,38 @@
 [package]
+name         = "xtask"
+version      .workspace = true
+edition      .workspace = true
+license-file .workspace = true
+authors      = ["Takumi Shimada <hello@takumi.earth>", "Aleksey Kladov <aleksey.kladov@gmail.com>"]
+repository   .workspace = true
+publish      .workspace = true
+readme       .workspace = true
+description  = "Workspace automation runner — `cargo xtask <subcommand>`."
+default-run  = "xtask"
+
+[lib]
 name = "xtask"
-version = "0.0.0"
-publish = false
-authors = ["Aleksey Kladov <aleksey.kladov@gmail.com>"]
-edition = "2024"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[[bin]]
+name = "precommit-hook"
+path = "src/precommit_hook.rs"
+
+# disabled for now
+# [lints]
+# workspace = true
 
 [dependencies]
-anyhow = "1.0.96"
+agents-md.workspace = true
+strict-xtask-agents-md.workspace = true
+strict-xtask-cargo.workspace = true
+strict-xtask-core.workspace = true
+anyhow = "1.0.103"
 xshell = "0.2.7"
+
+[dev-dependencies]
+strict-test-support = { workspace = true }
