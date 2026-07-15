@@ -61,6 +61,17 @@ strict-xtask-agents-md = { version = "0.1.0", git = "ssh://git@github.com/earthl
 trybuild = { git = "ssh://git@github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
 strict-test-support = { version = "0.1.0", git = "ssh://git@github.com/earthlings-dev/strict-test-support-rs.git", branch = "main" }
 snapbox = { version = "1.2", features = ["diff"], default-features = false }
+anstyle = "1"
+cargo_metadata = "0.23"
+globset = "0.4"
+ignore = "0.4"
+parking_lot = "0.12"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+proptest = { git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "strict", version = "2", features = ["std", "strict-test"], default-features = false }
+syn = { version = "2", features = ["full", "visit"] }
+thiserror = "2"
+toml = "1.1"
+toml_edit = "0.25"
 
 [patch.crates-io]
 
@@ -143,8 +154,6 @@ opt-level        = 0
 overflow-checks  = true
 debug            = true
 
-[patch]
-
 # ─── cargo-machete integration ─────────────────────────────────────────────
 [workspace.metadata.cargo-machete]
 # Deps intentionally unused in the workspace root can be listed here.
@@ -157,8 +166,7 @@ template       = "rust-template"
 
 [workspace.metadata.config.layout]
 schema-version = "0.1.0"
-kind           = "members-dir"
-members-dir    = "crates"
+kind = "flat"
 
 [workspace.metadata.config.update]
 schema-version   = "0.1.0"
@@ -994,3 +1002,11 @@ codex-manifest  = ".codex-plugin/plugin.json"
 claude-manifest = ".claude-plugin/plugin.json"
 skills          = "skills"
 source          = { kind = "git", url = "git@github.com:earthlings-dev/agent-plugin-rust-template.git", branch = "main" }
+
+[patch."https://github.com/strict-rs/strict-rowan"]
+rowan = { path = "." }
+xtask = { path = "xtask" }
+
+[patch."ssh://git@github.com/strict-rs/strict-rowan.git"]
+rowan = { path = "." }
+xtask = { path = "xtask" }

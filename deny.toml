@@ -47,11 +47,15 @@ allow-registry = [
   "https://github.com/rust-lang/crates.io-index",
 ]
 allow-git = [
+  "ssh://git@github.com/earthlings-dev/agents-md-rs.git",
   "ssh://git@github.com/earthlings-dev/rust-mutant-fleet.git",
   "ssh://git@github.com/earthlings-dev/strict-test-support-rs.git",
+  "ssh://git@github.com/earthlings-dev/strict-xtask-agents-md-rs.git",
+  "ssh://git@github.com/earthlings-dev/strict-xtask-cargo-rs.git",
+  "ssh://git@github.com/earthlings-dev/strict-xtask-core-rs.git",
   "ssh://git@github.com/strict-rs/strict-bpaf.git",
-  "ssh://git@github.com/strict-rs/strict-proptest.git",
-  "ssh://git@github.com/strict-rs/strict-trybuild.git",
+  "ssh://git@github.com/strict-rs/strict-taplo.git",
+  "ssh://git@github.com/strict-rs/strict-tracing.git",
 ]
 
 [advisories]
