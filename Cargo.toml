@@ -50,14 +50,14 @@ serde = { version = "1", default-features = false }
 serde_json = { version = "1", default-features = false }
 
 
-tracing            = { version = "0.1.44", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
-tracing-subscriber = { version = "0.3.23", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
+tracing = { version = "0.1.44", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
+tracing-subscriber = { version = "0.3.23", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
 
-bpaf = { git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10", default-features = false }
-template-core = { version = "0.1.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main" }
-template-xtask = { version = "0.1.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main" }
-trybuild = { git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
-strict-test-support = { version = "0.1.0", git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main" }
+bpaf = {  version = "0.10", default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync" }
+template-core = { version = "0.1.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+template-xtask = { version = "0.1.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+trybuild = {  version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict" }
+strict-test-support = { version = "0.1.0", git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main"}
 snapbox = { version = "1.2", features = ["diff"], default-features = false }
 anstyle = "1"
 cargo_metadata = "0.23"
@@ -65,35 +65,27 @@ globset = "0.4"
 ignore = "0.4"
 parking_lot = "0.12"
 proc-macro2 = { version = "1", features = ["span-locations"] }
-proptest = { git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict", version = "2", features = ["std", "strict-test"], default-features = false }
+proptest = {  version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
 syn = { version = "2", features = ["full", "visit"] }
-thiserror = "2"
+thiserror = {  version = "2" }
 toml = "1.1"
 toml_edit = "0.25"
 
 [patch.crates-io]
+bpaf = {  version = "0.10", git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync" }
 
 # pprof = { git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "upgrade", version = "0.16" }
-
-# strict-proptest (comment out if unused, do not remove)
-# proptest = { version = "1.11.0", git = "https://github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
-# proptest-macro = { version = "0.5.0", git = "https://github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
-# proptest-state-machine = { version = "0.8", git = "https://github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
-# proptest-derive = { version = "0.8", git = "https://github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
-
-# strict-trybuild (comment out if unused, do not remove)
+# proptest = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
+# proptest-macro = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
+# proptest-state-machine = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
+# proptest-derive = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
 # trybuild = { git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
-
-# strict-bpaf (comment out if unused, do not remove)
-bpaf = { git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10" }
 # bpaf_derive = { git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
 # bpaf_cauwugo = { git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
-
-# strict-tracing (comment out if unused, do not remove)
-tracing = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.44" }
+# tracing = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.44" }
 # tracing-appender = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
-tracing-attributes = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.31" }
-tracing-core = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.36" }
+# tracing-attributes = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.31" }
+# tracing-core = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.36" }
 # tracing-error = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.1" }
 # tracing-flame = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
 # tracing-futures = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
@@ -104,13 +96,24 @@ tracing-core = { git = "https://github.com/strict-rs/strict-tracing.git", branch
 # tracing-subscriber = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.23" }
 # tracing-test = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
 # tracing-tower = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
+# lsp-async-stub = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
+# taplo        = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
+# taplo-cli      = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
+# taplo-common = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
+# taplo-lsp    = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
+# taplo-wasm    = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
 
-# lsp-async-stub = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
-# taplo        = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
-# taplo-cli      = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
-# taplo-common = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
-# taplo-lsp    = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
-# taplo-wasm    = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
+
+
+
+
+[patch."https://github.com/strict-rs/strict-rowan"]
+rowan = { version = "0.17", path = "." }
+xtask = { path = "xtask" }
+
+[patch."https://github.com/strict-rs/strict-rowan.git"]
+rowan = { version = "0.17", path = "." }
+xtask = { path = "xtask" }
 
 # Original Taplo Release Profile
 # [profile.release]
@@ -156,11 +159,3 @@ debug            = true
 [workspace.metadata.cargo-machete]
 # Deps intentionally unused in the workspace root can be listed here.
 ignored = []
-
-[patch."https://github.com/strict-rs/strict-rowan"]
-rowan = { path = "." }
-xtask = { path = "xtask" }
-
-[patch."https://github.com/strict-rs/strict-rowan.git"]
-rowan = { path = "." }
-xtask = { path = "xtask" }
