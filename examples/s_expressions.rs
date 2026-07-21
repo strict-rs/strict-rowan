@@ -12,67 +12,23 @@
 use std::io;
 use std::io::Write;
 
-/// Let's start with defining all kinds of tokens and
-/// composite nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum SyntaxKind {
-  LeftParen,
-  RightParen,
-  Word,
-  Whitespace,
-  Error,
-  List,
-  Atom,
-  Root,
+use rowan::BuildError;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+enum ExampleError {
+  #[error(transparent)]
+  Build(#[from] BuildError),
+  #[error(transparent)]
+  Io(#[from] io::Error),
 }
 
-/// Some boilerplate is needed, as rowan settled on using its own
-/// `struct SyntaxKind(u16)` internally, instead of accepting the
-/// user's `enum SyntaxKind` as a type parameter.
-///
-/// First, to easily pass the enum variants into rowan via `.into()`:
-impl From<SyntaxKind> for rowan::SyntaxKind {
-  fn from(kind: SyntaxKind) -> Self {
-    Self(match kind {
-      SyntaxKind::LeftParen => 0,
-      SyntaxKind::RightParen => 1,
-      SyntaxKind::Word => 2,
-      SyntaxKind::Whitespace => 3,
-      SyntaxKind::Error => 4,
-      SyntaxKind::List => 5,
-      SyntaxKind::Atom => 6,
-      SyntaxKind::Root => 7,
-    })
-  }
-}
+#[path = "support/language.rs"]
+mod language_support;
 
-/// Second, implementing the `Language` trait teaches rowan to convert between
-/// these two SyntaxKind types, allowing for a nicer SyntaxNode API where
-/// "kinds" are values from our `enum SyntaxKind`, instead of plain u16 values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Lang {}
-
-impl rowan::Language for Lang {
-  type Kind = SyntaxKind;
-
-  fn kind_from_raw(raw: rowan::SyntaxKind) -> Self::Kind {
-    match raw.0 {
-      0 => SyntaxKind::LeftParen,
-      1 => SyntaxKind::RightParen,
-      2 => SyntaxKind::Word,
-      3 => SyntaxKind::Whitespace,
-      4 => SyntaxKind::Error,
-      5 => SyntaxKind::List,
-      6 => SyntaxKind::Atom,
-      7 => SyntaxKind::Root,
-      8.. => SyntaxKind::Error,
-    }
-  }
-
-  fn kind_to_raw(kind: Self::Kind) -> rowan::SyntaxKind {
-    kind.into()
-  }
-}
+language_support::define_language!(Lang, SyntaxKind, Error, [
+  LeftParen, RightParen, Word, Whitespace, Error, List, Atom, Root,
+]);
 
 /// GreenNode is an immutable tree, which is cheap to change,
 /// but doesn't contain offsets and parent pointers.
@@ -96,10 +52,9 @@ struct Parse {
 }
 
 /// Now, let's write a parser.
-/// Note that `parse` does not return a `Result`:
-/// by design, syntax tree can be built even for
-/// completely invalid source code.
-fn parse(text: &str) -> Parse {
+/// Syntax diagnostics remain successful parse outcomes, while builder protocol and allocation
+/// failures propagate separately.
+fn parse(text: &str) -> Result<Parse, BuildError> {
   struct Parser {
     /// input tokens, including whitespace,
     /// in *reverse* order.
@@ -122,79 +77,87 @@ fn parse(text: &str) -> Parse {
   }
 
   impl Parser {
-    fn parse(mut self) -> Parse {
+    fn parse(mut self) -> Result<Parse, BuildError> {
       self.builder.start_node(SyntaxKind::Root.into());
-      loop {
-        match self.sexp() {
-          SexpRes::Eof => break,
-          SexpRes::RParen => {
-            self.builder.start_node(SyntaxKind::Error.into());
-            self.errors.push(ParseError::UnmatchedRightParen);
-            self.bump();
-            self.builder.finish_node();
-          }
-          SexpRes::Ok => {}
-        }
-      }
-      self.skip_ws();
-      self.builder.finish_node();
+      while self.parse_root_item()? {}
+      self.skip_ws()?;
+      self.builder.finish_node()?;
 
-      Parse {
-        green_node: self.builder.finish(),
+      Ok(Parse {
+        green_node: self.builder.finish()?,
         errors:     self.errors,
-      }
+      })
     }
 
-    fn list(&mut self) {
-      self.builder.start_node(SyntaxKind::List.into());
-      self.bump();
-      loop {
-        match self.sexp() {
-          SexpRes::Eof => {
-            self.errors.push(ParseError::MissingRightParen);
-            break;
-          }
-          SexpRes::RParen => {
-            self.bump();
-            break;
-          }
-          SexpRes::Ok => {}
+    /// Parse or recover one root-level expression and report whether parsing should continue.
+    fn parse_root_item(&mut self) -> Result<bool, BuildError> {
+      match self.sexp()? {
+        SexpRes::Eof => Ok(false),
+        SexpRes::RParen => {
+          self.builder.start_node(SyntaxKind::Error.into());
+          self.errors.push(ParseError::UnmatchedRightParen);
+          self.bump()?;
+          self.builder.finish_node()?;
+          Ok(true)
         }
+        SexpRes::Ok => Ok(true),
       }
-      self.builder.finish_node();
     }
 
-    fn sexp(&mut self) -> SexpRes {
-      self.skip_ws();
+    fn list(&mut self) -> Result<(), BuildError> {
+      self.builder.start_node(SyntaxKind::List.into());
+      self.bump()?;
+      while self.parse_list_item()? {}
+      self.builder.finish_node()
+    }
+
+    /// Parse one list item and report whether the current list remains open.
+    fn parse_list_item(&mut self) -> Result<bool, BuildError> {
+      match self.sexp()? {
+        SexpRes::Eof => {
+          self.errors.push(ParseError::MissingRightParen);
+          Ok(false)
+        }
+        SexpRes::RParen => {
+          self.bump()?;
+          Ok(false)
+        }
+        SexpRes::Ok => Ok(true),
+      }
+    }
+
+    fn sexp(&mut self) -> Result<SexpRes, BuildError> {
+      self.skip_ws()?;
       let kind = match self.current() {
-        None => return SexpRes::Eof,
-        Some(SyntaxKind::RightParen) => return SexpRes::RParen,
+        None => return Ok(SexpRes::Eof),
+        Some(SyntaxKind::RightParen) => return Ok(SexpRes::RParen),
         Some(kind) => kind,
       };
       match kind {
-        SyntaxKind::LeftParen => self.list(),
+        SyntaxKind::LeftParen => self.list()?,
         SyntaxKind::Word => {
           self.builder.start_node(SyntaxKind::Atom.into());
-          self.bump();
-          self.builder.finish_node();
+          self.bump()?;
+          self.builder.finish_node()?;
         }
-        SyntaxKind::Error => self.bump(),
-        SyntaxKind::Whitespace => self.skip_ws(),
-        SyntaxKind::RightParen => return SexpRes::RParen,
+        SyntaxKind::Error => self.bump()?,
+        SyntaxKind::Whitespace => self.skip_ws()?,
+        SyntaxKind::RightParen => return Ok(SexpRes::RParen),
         SyntaxKind::List | SyntaxKind::Atom | SyntaxKind::Root => {
           self.builder.start_node(SyntaxKind::Error.into());
-          self.bump();
-          self.builder.finish_node();
+          self.bump()?;
+          self.builder.finish_node()?;
         }
       }
-      SexpRes::Ok
+      Ok(SexpRes::Ok)
     }
 
     /// Advance one token, adding it to the current branch of the tree builder.
-    fn bump(&mut self) {
+    fn bump(&mut self) -> Result<(), BuildError> {
       if let Some((kind, text)) = self.tokens.pop() {
-        self.builder.token(kind.into(), text.as_str());
+        self.builder.token(kind.into(), text.as_str())?;
       }
+      Ok(())
     }
 
     /// Peek at the first unprocessed token
@@ -202,10 +165,11 @@ fn parse(text: &str) -> Parse {
       self.tokens.last().map(|(kind, _)| *kind)
     }
 
-    fn skip_ws(&mut self) {
+    fn skip_ws(&mut self) -> Result<(), BuildError> {
       while self.current() == Some(SyntaxKind::Whitespace) {
-        self.bump()
+        self.bump()?;
       }
+      Ok(())
     }
   }
 
@@ -361,11 +325,10 @@ impl List {
     let arg1 = sexps.next()?.eval()?;
     let arg2 = sexps.next()?.eval()?;
     let result = match op {
-      Op::Add => arg1 + arg2,
-      Op::Sub => arg1 - arg2,
-      Op::Mul => arg1 * arg2,
-      Op::Div if arg2 == 0 => return None,
-      Op::Div => arg1 / arg2,
+      Op::Add => arg1.checked_add(arg2)?,
+      Op::Sub => arg1.checked_sub(arg2)?,
+      Op::Mul => arg1.checked_mul(arg2)?,
+      Op::Div => arg1.checked_div(arg2)?,
     };
     Some(result)
   }
@@ -377,12 +340,12 @@ impl Parse {
   }
 }
 
-fn evaluate(text: &str) -> Vec<Option<i64>> {
-  let parsed = parse(text);
-  match parsed.root() {
+fn evaluate(text: &str) -> Result<Vec<Option<i64>>, BuildError> {
+  let parsed = parse(text)?;
+  Ok(match parsed.root() {
     Some(root) => root.sexps().map(|sexp| sexp.eval()).collect(),
     None => Vec::new(),
-  }
+  })
 }
 
 const EXAMPLE_SEXPS: &str = "
@@ -393,11 +356,12 @@ nan
 (+ (* 15 2) 62)
 ";
 
-fn main() -> io::Result<()> {
-  let results = evaluate(EXAMPLE_SEXPS);
+fn main() -> Result<(), ExampleError> {
+  let results = evaluate(EXAMPLE_SEXPS)?;
   let stderr = io::stderr();
   let mut output = stderr.lock();
-  writeln!(output, "{results:?}")
+  writeln!(output, "{results:?}")?;
+  Ok(())
 }
 
 /// Split the input string into a flat list of tokens
@@ -431,22 +395,21 @@ fn lex(text: &str) -> Vec<(SyntaxKind, String)> {
   lexer
     .tokenize(text)
     .into_iter()
-    .map(|token| (token.len, kind(token.kind)))
-    .scan(0usize, |start_offset, (len, kind)| {
-      let token_text = text[*start_offset..*start_offset + len].to_owned();
-      *start_offset += len;
-      Some((kind, token_text))
+    .scan(text, |remaining, token| {
+      let token_text = remaining.get(..token.len)?.to_owned();
+      *remaining = remaining.get(token.len..)?;
+      Some((kind(token.kind), token_text))
     })
     .collect()
 }
 
 #[cfg(test)]
 mod tests {
-  use rowan::Language;
   use rowan::NodeOrToken;
   use strict_test_support::TestFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_ok;
   use strict_test_support::ensure_some;
 
   use super::Lang;
@@ -459,7 +422,7 @@ mod tests {
   #[test]
   fn parser_builds_lossless_nested_tree_without_errors() -> Result<(), TestFailure> {
     let text = "(+ (* 15 2) 62)";
-    let parsed = parse(text);
+    let parsed = ensure_ok(parse(text), "balanced input must build")?;
     ensure(parsed.errors().is_empty(), "balanced input must not produce parse errors")?;
     let root = parsed.syntax();
     ensure(root.kind() == SyntaxKind::Root, "the parsed syntax must have a Root node")?;
@@ -493,7 +456,7 @@ mod tests {
 
   #[test]
   fn parser_recovers_from_unbalanced_parentheses() -> Result<(), TestFailure> {
-    let parsed = parse(") (");
+    let parsed = ensure_ok(parse(") ("), "unbalanced input must still build")?;
     ensure(
       parsed.errors() == [ParseError::UnmatchedRightParen, ParseError::MissingRightParen],
       "unbalanced parentheses must produce ordered typed errors",
@@ -533,34 +496,23 @@ mod tests {
 
   #[test]
   fn evaluator_distinguishes_values_and_invalid_expressions() -> Result<(), TestFailure> {
-    let results = evaluate(super::EXAMPLE_SEXPS);
+    let results = ensure_ok(evaluate(super::EXAMPLE_SEXPS), "example expressions must build")?;
     ensure(
       results == [Some(92), Some(92), None, None, Some(92)],
       "evaluation must distinguish arithmetic values from division-by-zero and non-number failures",
+    )?;
+    let invalid = ensure_ok(
+      evaluate("(+ 9223372036854775807 1)\n(% 1 2)\n(/ -9223372036854775808 -1)"),
+      "overflow and invalid-operator syntax must still build",
+    )?;
+    ensure(
+      invalid == [None, None, None],
+      "checked addition, invalid operators, and checked division overflow must all return None",
     )
   }
 
   #[test]
   fn language_maps_unknown_raw_kinds_to_error() -> Result<(), TestFailure> {
-    ensure(
-      Lang::kind_from_raw(rowan::SyntaxKind(u16::MAX)) == SyntaxKind::Error,
-      "unknown raw syntax kinds must recover as Error",
-    )?;
-    for kind in [
-      SyntaxKind::LeftParen,
-      SyntaxKind::RightParen,
-      SyntaxKind::Word,
-      SyntaxKind::Whitespace,
-      SyntaxKind::Error,
-      SyntaxKind::List,
-      SyntaxKind::Atom,
-      SyntaxKind::Root,
-    ] {
-      ensure(
-        Lang::kind_from_raw(Lang::kind_to_raw(kind)) == kind,
-        "every declared S-expression syntax kind must round-trip",
-      )?;
-    }
-    Ok(())
+    super::language_support::verify_language::<Lang>()
   }
 }

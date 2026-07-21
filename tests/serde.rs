@@ -6,8 +6,10 @@ use rowan::SyntaxKind as RawSyntaxKind;
 use rowan::SyntaxNode;
 use serde_json::json;
 use strict_test_support::TestFailure;
+use strict_test_support::ensure;
 use strict_test_support::ensure_eq;
 use strict_test_support::ensure_ok;
+use strict_test_support::ensure_some;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum TestKind {
@@ -50,14 +52,21 @@ impl Language for TestLanguage {
 fn serde_feature_serializes_nested_nodes_tokens_and_empty_nodes() -> Result<(), TestFailure> {
   let mut builder = GreenNodeBuilder::new();
   builder.start_node(TestLanguage::kind_to_raw(TestKind::Root));
-  builder.token(TestLanguage::kind_to_raw(TestKind::Token), "a");
+  ensure_ok(
+    builder.token(TestLanguage::kind_to_raw(TestKind::Token), "a"),
+    "the first token must build",
+  )?;
   builder.start_node(TestLanguage::kind_to_raw(TestKind::Branch));
-  builder.token(TestLanguage::kind_to_raw(TestKind::Token), "β");
-  builder.finish_node();
+  ensure_ok(
+    builder.token(TestLanguage::kind_to_raw(TestKind::Token), "β"),
+    "the Unicode token must build",
+  )?;
+  ensure_ok(builder.finish_node(), "the branch must finish")?;
   builder.start_node(TestLanguage::kind_to_raw(TestKind::Empty));
-  builder.finish_node();
-  builder.finish_node();
-  let root = SyntaxNode::<TestLanguage>::new_root(builder.finish());
+  ensure_ok(builder.finish_node(), "the empty node must finish")?;
+  ensure_ok(builder.finish_node(), "the root must finish")?;
+  let green = ensure_ok(builder.finish(), "the green root must finish")?;
+  let root = SyntaxNode::<TestLanguage>::new_root(green);
 
   let actual = ensure_ok(serde_json::to_value(root), "the typed syntax root must serialize")?;
   let expected = json!({
@@ -92,5 +101,19 @@ fn serde_feature_serializes_nested_nodes_tokens_and_empty_nodes() -> Result<(), 
     &actual,
     &expected,
     "serialization must preserve the complete node and token wire contract",
+  )?;
+  let root_object = ensure_some(actual.as_object(), "the serialized root must be an object")?;
+  ensure(!root_object.contains_key("text"), "nodes must never acquire token-only text fields")?;
+  let children = ensure_some(
+    root_object.get("children").and_then(serde_json::Value::as_array),
+    "the serialized root must expose its child array",
+  )?;
+  let first_token = ensure_some(
+    children.first().and_then(serde_json::Value::as_object),
+    "the first child must be a token object",
+  )?;
+  ensure(
+    !first_token.contains_key("children"),
+    "tokens must never acquire node-only children fields",
   )
 }

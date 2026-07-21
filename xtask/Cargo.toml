@@ -27,4 +27,4 @@ template-core.workspace  = true
 template-xtask.workspace = true
 
 [dev-dependencies]
-strict-test-support.workspace = true
+strict-test-support = { workspace = true, default-features = false }

@@ -1,165 +1,166 @@
-use std::borrow::Borrow;
+//! Compact immutable green tokens.
+
 use std::fmt;
-use std::mem::ManuallyDrop;
-use std::mem::{
-  self,
-};
-use std::ops;
-use std::ptr;
 
 use countme::Count;
+use ecow::EcoString;
+use triomphe::Arc;
 
 use crate::TextSize;
-use crate::arc::Arc;
-use crate::arc::HeaderSlice;
-use crate::arc::ThinArc;
+use crate::green::GreenError;
 use crate::green::SyntaxKind;
+use crate::green::text_size_from_usize;
 
+/// Shared token allocation contents.
 #[derive(PartialEq, Eq, Hash)]
-struct GreenTokenHead {
-  kind: SyntaxKind,
-  _c:   Count<GreenToken>,
+struct GreenTokenPayload {
+  /// Raw token kind.
+  kind:   SyntaxKind,
+  /// Compact UTF-8 token text.
+  text:   EcoString,
+  /// Allocation accounting marker.
+  _count: Count<GreenToken>,
 }
 
-type Repr = HeaderSlice<GreenTokenHead, [u8]>;
-type ReprThin = HeaderSlice<GreenTokenHead, [u8; 0]>;
-#[repr(transparent)]
-pub struct GreenTokenData {
-  data: ReprThin,
-}
-
-impl PartialEq for GreenTokenData {
-  fn eq(&self, other: &Self) -> bool {
-    self.kind() == other.kind() && self.text() == other.text()
-  }
-}
-
-/// Leaf node in the immutable tree.
-#[derive(PartialEq, Eq, Hash, Clone)]
+/// A leaf in an immutable green syntax tree.
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct GreenToken {
-  ptr: ThinArc<GreenTokenHead, u8>,
+  /// Shared token payload.
+  payload: Arc<GreenTokenPayload>,
 }
 
-impl ToOwned for GreenTokenData {
-  type Owned = GreenToken;
-
-  #[inline]
-  fn to_owned(&self) -> GreenToken {
-    let green = unsafe { GreenToken::from_raw(ptr::NonNull::from(self)) };
-    let green = ManuallyDrop::new(green);
-    GreenToken::clone(&green)
+impl GreenToken {
+  /// Create a token after validating its UTF-8 byte length.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`GreenError::TokenTextTooLong`] when `text` cannot be represented by `TextSize`, or
+  /// [`GreenError::AllocationFailed`] when the shared payload allocation fails.
+  pub fn new(kind: SyntaxKind, text: &str) -> Result<Self, GreenError> {
+    let _ = text_size_from_usize(text.len())?;
+    let payload = GreenTokenPayload {
+      kind,
+      text: EcoString::from(text),
+      _count: Count::new(),
+    };
+    Arc::try_new(payload)
+      .map(|payload| Self {
+        payload,
+      })
+      .map_err(|_| GreenError::AllocationFailed)
   }
-}
 
-impl Borrow<GreenTokenData> for GreenToken {
-  #[inline]
-  fn borrow(&self) -> &GreenTokenData {
-    self
+  /// Return this token's raw syntax kind.
+  pub fn kind(&self) -> SyntaxKind {
+    self.payload.kind
   }
-}
 
-impl fmt::Debug for GreenTokenData {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("GreenToken")
-      .field("kind", &self.kind())
-      .field("text", &self.text())
-      .finish()
+  /// Borrow this token's exact UTF-8 text.
+  pub fn text(&self) -> &str {
+    &self.payload.text
+  }
+
+  /// Return this token's UTF-8 byte length.
+  pub fn text_len(&self) -> TextSize {
+    match text_size_from_usize(self.payload.text.len()) {
+      Ok(text_len) => text_len,
+      Err(_) => TextSize::from(u32::MAX),
+    }
+  }
+
+  /// Test whether two tokens share the same allocation.
+  pub fn ptr_eq(&self, other: &Self) -> bool {
+    Arc::ptr_eq(&self.payload, &other.payload)
+  }
+
+  /// Hash the token allocation identity rather than its contents.
+  pub(crate) fn hash_identity<HasherType: std::hash::Hasher>(&self, state: &mut HasherType) {
+    std::ptr::hash(Arc::as_ptr(&self.payload), state);
   }
 }
 
 impl fmt::Debug for GreenToken {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let data: &GreenTokenData = self;
-    fmt::Debug::fmt(data, f)
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    crate::debug::write(crate::debug::DebugTarget::GreenToken(self), formatter)
   }
 }
 
 impl fmt::Display for GreenToken {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let data: &GreenTokenData = self;
-    fmt::Display::fmt(data, f)
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fmt::Display::fmt(self.text(), formatter)
   }
 }
 
-impl fmt::Display for GreenTokenData {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "{}", self.text())
-  }
-}
+#[cfg(test)]
+mod tests {
+  use std::hash::Hash;
 
-impl GreenTokenData {
-  /// Kind of this Token.
-  #[inline]
-  pub fn kind(&self) -> SyntaxKind {
-    self.data.header.kind
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_ne;
+  use strict_test_support::ensure_ok;
+
+  use super::GreenToken;
+  use crate::SyntaxKind;
+  use crate::TextSize;
+  use crate::test_support::ensure_one_word;
+  use crate::test_support::ensure_same_hash;
+
+  /// Construct a green token through its real fallible API.
+  fn token(kind: u16, text: &str) -> Result<GreenToken, TestFailure> {
+    ensure_ok(GreenToken::new(SyntaxKind(kind), text), "the green token must allocate")
   }
 
-  /// Text of this Token.
-  #[inline]
-  pub fn text(&self) -> &str {
-    unsafe { std::str::from_utf8_unchecked(self.data.slice()) }
-  }
-
-  /// Returns the length of the text covered by this token.
-  #[inline]
-  pub fn text_len(&self) -> TextSize {
-    TextSize::of(self.text())
-  }
-}
-
-impl GreenToken {
-  /// Creates new Token.
-  #[inline]
-  pub fn new(kind: SyntaxKind, text: &str) -> GreenToken {
-    let head = GreenTokenHead {
-      kind,
-      _c: Count::new(),
-    };
-    let ptr = ThinArc::from_header_and_iter(head, text.bytes());
-    GreenToken {
-      ptr,
+  #[test]
+  fn token_handles_preserve_compact_and_shared_text_contracts() -> Result<(), TestFailure> {
+    for text in ["", "short", "a token text long enough to spill", "aβ🙂"] {
+      let green = token(7, text)?;
+      ensure(green.kind() == SyntaxKind(7), "the token kind must remain exact")?;
+      ensure_eq(&green.text(), &text, "the token text must remain exact")?;
+      let expected_len = ensure_ok(TextSize::try_from(text.len()), "the fixture length must fit")?;
+      ensure(green.text_len() == expected_len, "the token length must count UTF-8 bytes")?;
+      ensure_eq(&green.to_string(), &text.to_owned(), "token display must preserve text")?;
     }
-  }
-  #[inline]
-  pub(crate) fn into_raw(this: GreenToken) -> ptr::NonNull<GreenTokenData> {
-    let green = ManuallyDrop::new(this);
-    let green: &GreenTokenData = &green;
-    ptr::NonNull::from(green)
+    Ok(())
   }
 
-  /// # Safety
-  ///
-  /// This function uses `unsafe` code to create an `Arc` from a raw pointer and then transmutes it
-  /// into a `ThinArc`.
-  ///
-  /// - The raw pointer must be valid and correctly aligned for the type `ReprThin`.
-  /// - The lifetime of the raw pointer must outlive the lifetime of the `Arc` created from it.
-  /// - The transmute operation must be safe, meaning that the memory layout of `Arc<ReprThin>` must
-  ///   be compatible with `ThinArc<GreenTokenHead, u8>`.
-  ///
-  /// Failure to uphold these invariants can lead to undefined behavior.
-  #[inline]
-  pub(crate) unsafe fn from_raw(ptr: ptr::NonNull<GreenTokenData>) -> GreenToken {
-    let arc = unsafe {
-      let arc = Arc::from_raw(&ptr.as_ref().data as *const ReprThin);
-      mem::transmute::<Arc<ReprThin>, ThinArc<GreenTokenHead, u8>>(arc)
-    };
-    GreenToken {
-      ptr: arc
-    }
+  #[test]
+  fn token_identity_is_distinct_from_structural_equality() -> Result<(), TestFailure> {
+    let first = token(1, "same")?;
+    let shared = first.clone();
+    let separate = token(1, "same")?;
+    let different_kind = token(2, "same")?;
+    let different_text = token(1, "different")?;
+
+    ensure(first.ptr_eq(&shared), "cloning a token handle must retain allocation identity")?;
+    ensure(!first.ptr_eq(&separate), "separate equal tokens must retain distinct allocations")?;
+    ensure_eq(&first, &separate, "separate equal tokens must compare structurally")?;
+    ensure_ne(&first, &different_kind, "different kinds must compare unequal")?;
+    ensure_ne(&first, &different_text, "different text must compare unequal")?;
+    ensure_eq(
+      &format!("{first:?}"),
+      &"GreenToken { kind: SyntaxKind(1), text: \"same\" }".to_owned(),
+      "token debug output must expose stable semantic metadata",
+    )?;
+
+    ensure_same_hash(
+      &first,
+      &separate,
+      Hash::hash,
+      "structurally equal tokens must produce equal structural hashes",
+    )?;
+    ensure_same_hash(
+      &first,
+      &shared,
+      GreenToken::hash_identity,
+      "cloned token handles must produce equal allocation-identity hashes",
+    )
   }
-}
 
-impl ops::Deref for GreenToken {
-  type Target = GreenTokenData;
-
-  #[inline]
-  fn deref(&self) -> &GreenTokenData {
-    unsafe {
-      let repr: &Repr = &self.ptr;
-      let repr: &ReprThin = &*(repr as *const Repr as *const ReprThin);
-      mem::transmute::<&ReprThin, &GreenTokenData>(repr)
-    }
+  #[test]
+  fn token_handle_remains_one_machine_word() -> Result<(), TestFailure> {
+    ensure_one_word::<GreenToken>("a green token handle must remain one machine word")
   }
 }

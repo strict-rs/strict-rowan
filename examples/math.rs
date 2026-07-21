@@ -13,67 +13,30 @@
 //!     - "+" Token(Add)
 //!     - "4" Token(Number)
 
-use std::io;
 use std::io::Write;
 use std::iter::Peekable;
 
+use rowan::BuildError;
 use rowan::GreenNodeBuilder;
 use rowan::NodeOrToken;
+use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum SyntaxKind {
-  Whitespace,
-  Add,
-  Sub,
-  Mul,
-  Div,
-  Number,
-  Error,
-  Operation,
-  Root,
+#[derive(Debug, Error)]
+enum ExampleError {
+  #[error(transparent)]
+  Build(#[from] BuildError),
+  #[error(transparent)]
+  Io(#[from] std::io::Error),
+  #[error("syntax-tree indentation overflow")]
+  IndentationOverflow,
 }
 
-impl From<SyntaxKind> for rowan::SyntaxKind {
-  fn from(kind: SyntaxKind) -> Self {
-    Self(match kind {
-      SyntaxKind::Whitespace => 0,
-      SyntaxKind::Add => 1,
-      SyntaxKind::Sub => 2,
-      SyntaxKind::Mul => 3,
-      SyntaxKind::Div => 4,
-      SyntaxKind::Number => 5,
-      SyntaxKind::Error => 6,
-      SyntaxKind::Operation => 7,
-      SyntaxKind::Root => 8,
-    })
-  }
-}
+#[path = "support/language.rs"]
+mod language_support;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Lang {}
-
-impl rowan::Language for Lang {
-  type Kind = SyntaxKind;
-
-  fn kind_from_raw(raw: rowan::SyntaxKind) -> Self::Kind {
-    match raw.0 {
-      0 => SyntaxKind::Whitespace,
-      1 => SyntaxKind::Add,
-      2 => SyntaxKind::Sub,
-      3 => SyntaxKind::Mul,
-      4 => SyntaxKind::Div,
-      5 => SyntaxKind::Number,
-      6 => SyntaxKind::Error,
-      7 => SyntaxKind::Operation,
-      8 => SyntaxKind::Root,
-      9.. => SyntaxKind::Error,
-    }
-  }
-
-  fn kind_to_raw(kind: Self::Kind) -> rowan::SyntaxKind {
-    kind.into()
-  }
-}
+language_support::define_language!(Lang, SyntaxKind, Error, [
+  Whitespace, Add, Sub, Mul, Div, Number, Error, Operation, Root,
+]);
 
 type SyntaxNode = rowan::SyntaxNode<Lang>;
 type SyntaxElement = rowan::SyntaxElement<Lang>;
@@ -84,60 +47,63 @@ struct Parser<I: Iterator<Item = (SyntaxKind, String)>> {
 }
 
 impl<I: Iterator<Item = (SyntaxKind, String)>> Parser<I> {
-  fn peek(&mut self) -> Option<SyntaxKind> {
+  fn peek(&mut self) -> Result<Option<SyntaxKind>, BuildError> {
     while self.iter.peek().is_some_and(|(kind, _)| *kind == SyntaxKind::Whitespace) {
-      self.bump();
+      self.bump()?;
     }
-    self.iter.peek().map(|(kind, _)| *kind)
+    Ok(self.iter.peek().map(|(kind, _)| *kind))
   }
 
-  fn bump(&mut self) {
+  fn bump(&mut self) -> Result<(), BuildError> {
     if let Some((token, string)) = self.iter.next() {
-      self.builder.token(token.into(), string.as_str());
+      self.builder.token(token.into(), string.as_str())?;
     }
+    Ok(())
   }
 
-  fn parse_val(&mut self) {
-    match self.peek() {
-      Some(SyntaxKind::Number) => self.bump(),
+  fn parse_val(&mut self) -> Result<(), BuildError> {
+    match self.peek()? {
+      Some(SyntaxKind::Number) => self.bump()?,
       Some(_) => {
         self.builder.start_node(SyntaxKind::Error.into());
-        self.bump();
-        self.builder.finish_node();
+        self.bump()?;
+        self.builder.finish_node()?;
       }
       None => {}
     }
+    Ok(())
   }
 
-  fn handle_operation(&mut self, tokens: &[SyntaxKind], next: fn(&mut Self)) {
+  fn handle_operation(&mut self, tokens: &[SyntaxKind], next: fn(&mut Self) -> Result<(), BuildError>) -> Result<(), BuildError> {
     let checkpoint = self.builder.checkpoint();
-    next(self);
-    while self.peek().is_some_and(|kind| tokens.contains(&kind)) {
-      self.builder.start_node_at(checkpoint, SyntaxKind::Operation.into());
-      self.bump();
-      next(self);
-      self.builder.finish_node();
+    next(self)?;
+    while self.peek()?.is_some_and(|kind| tokens.contains(&kind)) {
+      self.builder.start_node_at(&checkpoint, SyntaxKind::Operation.into())?;
+      self.bump()?;
+      next(self)?;
+      self.builder.finish_node()?;
     }
+    Ok(())
   }
 
-  fn parse_mul(&mut self) {
+  fn parse_mul(&mut self) -> Result<(), BuildError> {
     self.handle_operation(&[SyntaxKind::Mul, SyntaxKind::Div], Self::parse_val)
   }
 
-  fn parse_add(&mut self) {
+  fn parse_add(&mut self) -> Result<(), BuildError> {
     self.handle_operation(&[SyntaxKind::Add, SyntaxKind::Sub], Self::parse_mul)
   }
 
-  fn parse(mut self) -> SyntaxNode {
+  fn parse(mut self) -> Result<SyntaxNode, BuildError> {
     self.builder.start_node(SyntaxKind::Root.into());
-    self.parse_add();
-    self.builder.finish_node();
+    self.parse_add()?;
+    self.builder.finish_node()?;
 
-    SyntaxNode::new_root(self.builder.finish())
+    Ok(SyntaxNode::new_root(self.builder.finish()?))
   }
 }
 
-fn parse_tokens(tokens: impl IntoIterator<Item = (SyntaxKind, String)>) -> SyntaxNode {
+fn parse_tokens(tokens: impl IntoIterator<Item = (SyntaxKind, String)>) -> Result<SyntaxNode, BuildError> {
   Parser {
     builder: GreenNodeBuilder::new(),
     iter:    tokens.into_iter().peekable(),
@@ -166,31 +132,35 @@ fn documented_tokens() -> Vec<(SyntaxKind, String)> {
   .collect()
 }
 
-fn write_tree(output: &mut impl Write, indent: usize, element: SyntaxElement) -> io::Result<()> {
-  let kind = element.kind();
-  write!(output, "{:indent$}", "", indent = indent)?;
-  match element {
-    NodeOrToken::Node(node) => {
-      writeln!(output, "- {kind:?}")?;
-      for child in node.children_with_tokens() {
-        write_tree(output, indent + 2, child)?;
+fn write_tree(output: &mut impl Write, element: SyntaxElement) -> Result<(), ExampleError> {
+  let mut stack = vec![(0_usize, element)];
+  while let Some((indent, current)) = stack.pop() {
+    let kind = current.kind();
+    write!(output, "{:indent$}", "", indent = indent)?;
+    match current {
+      NodeOrToken::Node(node) => {
+        writeln!(output, "- {kind:?}")?;
+        let child_indent = indent.checked_add(2).ok_or(ExampleError::IndentationOverflow)?;
+        let children = node.children_with_tokens().collect::<Vec<_>>();
+        for child in children.into_iter().rev() {
+          stack.push((child_indent, child));
+        }
       }
-      Ok(())
+      NodeOrToken::Token(token) => writeln!(output, "- {:?} {kind:?}", token.text())?,
     }
-    NodeOrToken::Token(token) => writeln!(output, "- {:?} {kind:?}", token.text()),
   }
+  Ok(())
 }
 
-fn main() -> io::Result<()> {
-  let ast = parse_tokens(documented_tokens());
-  let stdout = io::stdout();
+fn main() -> Result<(), ExampleError> {
+  let ast = parse_tokens(documented_tokens())?;
+  let stdout = std::io::stdout();
   let mut output = stdout.lock();
-  write_tree(&mut output, 0, ast.into())
+  write_tree(&mut output, ast.into())
 }
 
 #[cfg(test)]
 mod tests {
-  use rowan::Language;
   use rowan::NodeOrToken;
   use strict_test_support::TestFailure;
   use strict_test_support::ensure;
@@ -206,7 +176,7 @@ mod tests {
 
   #[test]
   fn parser_preserves_precedence_lossless_text_and_rendered_tree() -> Result<(), TestFailure> {
-    let root = parse_tokens(documented_tokens());
+    let root = ensure_ok(parse_tokens(documented_tokens()), "the documented tokens must build")?;
     ensure_eq(
       &root.to_string(),
       &"1 + 2 * 3 + 4".to_owned(),
@@ -214,7 +184,7 @@ mod tests {
     )?;
 
     let mut rendered = Vec::new();
-    ensure_ok(write_tree(&mut rendered, 0, root.clone().into()), "the syntax tree must render")?;
+    ensure_ok(write_tree(&mut rendered, root.clone().into()), "the syntax tree must render")?;
     let rendered = ensure_ok(String::from_utf8(rendered), "the rendered syntax tree must be UTF-8")?;
     let expected = concat!(
       "- Root\n", "  - Operation\n", "    - Operation\n", "      - \"1\" Number\n", "      - \" \" Whitespace\n", "      - \"+\" Add\n",
@@ -253,7 +223,7 @@ mod tests {
 
   #[test]
   fn parser_wraps_unexpected_values_without_losing_text() -> Result<(), TestFailure> {
-    let root = parse_tokens([(SyntaxKind::Add, "+".to_owned())]);
+    let root = ensure_ok(parse_tokens([(SyntaxKind::Add, "+".to_owned())]), "recovery input must build")?;
     ensure_eq(&root.to_string(), &"+".to_owned(), "an unexpected value token must remain lossless")?;
     let error = ensure_some(root.children().next(), "an unexpected value must produce an error node")?;
     ensure(error.kind() == SyntaxKind::Error, "the recovery node must have Error kind")?;
@@ -268,7 +238,7 @@ mod tests {
       "the retained token text must remain exact",
     )?;
 
-    let empty = parse_tokens(std::iter::empty());
+    let empty = ensure_ok(parse_tokens(std::iter::empty()), "empty input must build")?;
     ensure(empty.kind() == SyntaxKind::Root, "empty input must still produce a Root node")?;
     ensure_eq(&empty.to_string(), &String::new(), "empty input must have empty text")?;
     ensure_eq(
@@ -280,26 +250,6 @@ mod tests {
 
   #[test]
   fn language_maps_unknown_raw_kinds_to_error() -> Result<(), TestFailure> {
-    ensure(
-      Lang::kind_from_raw(rowan::SyntaxKind(u16::MAX)) == SyntaxKind::Error,
-      "unknown raw syntax kinds must recover as Error",
-    )?;
-    for kind in [
-      SyntaxKind::Whitespace,
-      SyntaxKind::Add,
-      SyntaxKind::Sub,
-      SyntaxKind::Mul,
-      SyntaxKind::Div,
-      SyntaxKind::Number,
-      SyntaxKind::Error,
-      SyntaxKind::Operation,
-      SyntaxKind::Root,
-    ] {
-      ensure(
-        Lang::kind_from_raw(Lang::kind_to_raw(kind)) == kind,
-        "every declared math syntax kind must round-trip",
-      )?;
-    }
-    Ok(())
+    super::language_support::verify_language::<Lang>()
   }
 }

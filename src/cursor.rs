@@ -1,103 +1,15 @@
-//! Implementation of the cursors -- API for convenient access to syntax trees.
-//!
-//! Functional programmers will recognize that this module implements a zipper
-//! for a purely functional (green) tree.
-//!
-//! A cursor node (`SyntaxNode`) points to a `GreenNode` and a parent
-//! `SyntaxNode`. This allows cursor to provide iteration over both ancestors
-//! and descendants, as well as a cheep access to absolute offset of the node in
-//! file.
-//!
-//! By default `SyntaxNode`s are immutable, but you can get a mutable copy of
-//! the tree by calling `clone_for_update`. Mutation is based on interior
-//! mutability and doesn't need `&mut`. You can have two `SyntaxNode`s pointing
-//! at different parts of the same tree; mutations via the first node will be
-//! reflected in the other.
+//! Immutable raw cursors over structurally shared green trees.
 
-// Implementation notes:
-//
-// The implementation is utterly and horribly unsafe. This whole module is an
-// unsafety boundary. It is believed that the API here is, in principle, sound,
-// but the implementation might have bugs.
-//
-// The core type is `NodeData` -- a heap-allocated reference counted object,
-// which points to a green node or a green token, and to the parent `NodeData`.
-// Publicly-exposed `SyntaxNode` and `SyntaxToken` own a reference to
-// `NodeData`.
-//
-// `NodeData`s are transient, and are created and destroyed during tree
-// traversals. In general, only currently referenced nodes and their ancestors
-// are alive at any given moment.
-//
-// More specifically, `NodeData`'s ref count is equal to the number of
-// outstanding `SyntaxNode` and `SyntaxToken` plus the number of children with
-// non-zero ref counts. For example, if the user has only a single `SyntaxNode`
-// pointing somewhere in the middle of the tree, then all `NodeData` on the path
-// from that point towards the root have ref count equal to one.
-//
-// `NodeData` which doesn't have a parent (is a root) owns the corresponding
-// green node or token, and is responsible for freeing it.
-//
-// That's mostly it for the immutable subset of the API. Mutation is fun though,
-// you'll like it!
-//
-// Mutability is a run-time property of a tree of `NodeData`. The whole tree is
-// either mutable or immutable. `clone_for_update` clones the whole tree of
-// `NodeData`s, making it mutable (note that the green tree is re-used).
-//
-// If the tree is mutable, then all live `NodeData` are additionally liked to
-// each other via intrusive liked lists. Specifically, there are two pointers to
-// siblings, as well as a pointer to the first child. Note that only live nodes
-// are considered. If the user only has `SyntaxNode`s for  the first and last
-// children of some particular node, then their `NodeData` will point at each
-// other.
-//
-// The links are used to propagate mutations across the tree. Specifically, each
-// `NodeData` remembers it's index in parent. When the node is detached from or
-// attached to the tree, we need to adjust the indices of all subsequent
-// siblings. That's what makes the `for c in node.children() { c.detach() }`
-// pattern work despite the apparent iterator invalidation.
-//
-// This code is encapsulated into the sorted linked list (`sll`) module.
-//
-// The actual mutation consist of functionally "mutating" (creating a
-// structurally shared copy) the green node, and then re-spinning the tree. This
-// is a delicate process: `NodeData` point directly to the green nodes, so we
-// must make sure that those nodes don't move. Additionally, during mutation a
-// node might become or might stop being a root, so we must take care to not
-// double free / leak its green node.
-//
-// Because we can change green nodes using only shared references, handing out
-// references into green nodes in the public API would be unsound. We don't do
-// that, but we do use such references internally a lot. Additionally, for
-// tokens the underlying green token actually is immutable, so we can, and do
-// return `&str`.
-//
-// Invariants [must not leak outside of the module]:
-//    - Mutability is the property of the whole tree. Intermixing elements that differ in mutability
-//      is not allowed.
-//    - Mutability property is persistent.
-//    - References to the green elements' data are not exposed into public API when the tree is
-//      mutable.
-//    - TBD
-
-use std::borrow::Cow;
-use std::cell::Cell;
 use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::iter;
-use std::mem::ManuallyDrop;
-use std::mem::{
-  self,
-};
-use std::ops::Range;
-use std::ptr;
-use std::slice;
 
-use countme::Count;
+use thiserror::Error;
+use triomphe::Arc;
 
 use crate::Direction;
+use crate::GreenElement;
 use crate::GreenNode;
 use crate::GreenToken;
 use crate::NodeOrToken;
@@ -106,1617 +18,1740 @@ use crate::TextRange;
 use crate::TextSize;
 use crate::TokenAtOffset;
 use crate::WalkEvent;
+use crate::cursor_data::SyntaxNodeData;
+use crate::cursor_data::SyntaxTokenData;
+pub use crate::cursor_editor::EditError;
+pub use crate::cursor_editor::EditorElementId;
+pub use crate::cursor_editor::EditorNodeId;
+pub use crate::cursor_editor::EditorTokenId;
+pub use crate::cursor_editor::SpliceOutcome;
+pub use crate::cursor_editor::SyntaxEditor;
+pub use crate::cursor_traversal::Preorder;
+pub use crate::cursor_traversal::PreorderWithTokens;
+pub use crate::cursor_traversal::SyntaxElementChildren;
+pub use crate::cursor_traversal::SyntaxElementChildrenByKind;
+pub use crate::cursor_traversal::SyntaxNodeChildren;
+pub use crate::cursor_traversal::SyntaxNodeChildrenByKind;
+pub use crate::cursor_traversal::TraversalError;
 use crate::green::GreenChild;
-use crate::green::GreenElementRef;
-use crate::green::GreenNodeData;
-use crate::green::GreenTokenData;
+use crate::green::GreenError;
 use crate::green::SyntaxKind;
-use crate::sll;
-use crate::utility_types::Delta;
 
-enum Green {
-  Node { ptr: Cell<ptr::NonNull<GreenNodeData>> },
-  Token { ptr: ptr::NonNull<GreenTokenData> },
+/// A rejected source offset or text range.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RangeError {
+  /// An offset lies outside the valid closed query interval.
+  #[error("offset {offset:?} is outside {valid:?}")]
+  OffsetOutOfBounds {
+    /// Rejected offset.
+    offset: TextSize,
+    /// Valid containing range.
+    valid:  TextRange,
+  },
+  /// A range lies outside the valid containing range.
+  #[error("range {requested:?} is outside {valid:?}")]
+  RangeOutOfBounds {
+    /// Rejected range.
+    requested: TextRange,
+    /// Valid containing range.
+    valid:     TextRange,
+  },
+  /// Caller-provided range endpoints are reversed.
+  #[error("range start {start:?} is after end {end:?}")]
+  ReversedRange {
+    /// Rejected start offset.
+    start: TextSize,
+    /// Rejected end offset.
+    end:   TextSize,
+  },
+  /// A byte offset falls inside a UTF-8 code point.
+  #[error("offset {offset:?} is not a UTF-8 character boundary")]
+  NotCharBoundary {
+    /// Rejected relative offset.
+    offset: TextSize,
+  },
+  /// Translating a relative offset into an absolute offset overflowed.
+  #[error("offset arithmetic overflow while adding {delta:?} to {base:?}")]
+  OffsetArithmeticOverflow {
+    /// Base offset.
+    base:  TextSize,
+    /// Relative delta.
+    delta: TextSize,
+  },
 }
 
-struct _SyntaxElement;
-
-struct NodeData {
-  _c: Count<_SyntaxElement>,
-
-  rc:     Cell<u32>,
-  parent: Cell<Option<ptr::NonNull<NodeData>>>,
-  index:  Cell<u32>,
-  green:  Green,
-
-  /// Invariant: never changes after NodeData is created.
-  mutable: bool,
-  /// Absolute offset for immutable nodes, unused for mutable nodes.
-  offset:  TextSize,
-  // The following links only have meaning when `mutable` is true.
-  first:   Cell<*const NodeData>,
-  /// Invariant: never null if mutable.
-  next:    Cell<*const NodeData>,
-  /// Invariant: never null if mutable.
-  prev:    Cell<*const NodeData>,
-}
-
-unsafe impl sll::Elem for NodeData {
-  fn prev(&self) -> &Cell<*const Self> {
-    &self.prev
-  }
-  fn next(&self) -> &Cell<*const Self> {
-    &self.next
-  }
-  fn key(&self) -> &Cell<u32> {
-    &self.index
-  }
-}
-
+/// A raw node or token cursor.
 pub type SyntaxElement = NodeOrToken<SyntaxNode, SyntaxToken>;
 
+/// Immutable raw cursor pointing at a green node and its absolute source position.
+#[derive(Clone)]
+#[repr(transparent)]
 pub struct SyntaxNode {
-  ptr: ptr::NonNull<NodeData>,
+  /// Shared immutable red payload.
+  pub(crate) payload: Arc<SyntaxNodeData>,
 }
 
-impl Clone for SyntaxNode {
-  #[inline]
-  fn clone(&self) -> Self {
-    self.data().inc_rc();
-    SyntaxNode {
-      ptr: self.ptr
-    }
-  }
-}
-
-impl Drop for SyntaxNode {
-  #[inline]
-  fn drop(&mut self) {
-    if self.data().dec_rc() {
-      unsafe { free(self.ptr) }
-    }
-  }
-}
-
-#[derive(Debug)]
+/// Immutable raw cursor pointing at a green token and its absolute source position.
+#[derive(Clone)]
+#[repr(transparent)]
 pub struct SyntaxToken {
-  ptr: ptr::NonNull<NodeData>,
+  /// Shared immutable red payload.
+  pub(crate) payload: Arc<SyntaxTokenData>,
 }
 
-impl Clone for SyntaxToken {
-  #[inline]
-  fn clone(&self) -> Self {
-    self.data().inc_rc();
-    SyntaxToken {
-      ptr: self.ptr
-    }
-  }
+/// Fully owned description of one red child cursor.
+struct ElementDescriptor {
+  /// Parent node payload.
+  parent: Arc<SyntaxNodeData>,
+  /// Owned immutable green child.
+  green:  GreenElement,
+  /// Child index.
+  index:  usize,
+  /// Checked absolute offset.
+  offset: TextSize,
 }
 
-impl Drop for SyntaxToken {
-  #[inline]
-  fn drop(&mut self) {
-    if self.data().dec_rc() {
-      unsafe { free(self.ptr) }
-    }
-  }
+/// Fully owned description of one red node cursor.
+struct NodeDescriptor {
+  /// Parent node payload.
+  parent: Arc<SyntaxNodeData>,
+  /// Owned immutable green node.
+  green:  GreenNode,
+  /// Child index.
+  index:  usize,
+  /// Checked absolute offset.
+  offset: TextSize,
 }
 
-#[inline(never)]
-unsafe fn free(mut data: ptr::NonNull<NodeData>) {
-  unsafe {
-    loop {
-      debug_assert_eq!(data.as_ref().rc.get(), 0);
-      debug_assert!(data.as_ref().first.get().is_null());
-      let node = Box::from_raw(data.as_ptr());
-      match node.parent.take() {
-        Some(parent) => {
-          debug_assert!(parent.as_ref().rc.get() > 0);
-          if node.mutable {
-            sll::unlink(&parent.as_ref().first, &*node)
-          }
-          if parent.as_ref().dec_rc() {
-            data = parent;
-          } else {
-            break;
-          }
-        }
-        None => {
-          match &node.green {
-            Green::Node {
-              ptr,
-            } => {
-              let _ = GreenNode::from_raw(ptr.get());
-            }
-            Green::Token {
-              ptr,
-            } => {
-              let _ = GreenToken::from_raw(*ptr);
-            }
-          }
-          break;
-        }
-      }
-    }
+/// Construct a valid text range without exposing an overflow panic path.
+fn validated_text_range(offset: TextSize, text_len: TextSize) -> TextRange {
+  match offset.checked_add(text_len) {
+    Some(end) => TextRange::new(offset, end),
+    None => TextRange::empty(offset),
   }
 }
 
-impl NodeData {
-  #[inline]
-  fn new(parent: Option<SyntaxNode>, index: u32, offset: TextSize, green: Green, mutable: bool) -> ptr::NonNull<NodeData> {
-    let parent = ManuallyDrop::new(parent);
-    let res = NodeData {
-      _c: Count::new(),
-      rc: Cell::new(1),
-      parent: Cell::new(parent.as_ref().map(|it| it.ptr)),
-      index: Cell::new(index),
-      green,
+/// Add a parent offset to a validated child-relative offset.
+fn child_offset(parent: &SyntaxNodeData, child: &GreenChild) -> Option<TextSize> {
+  parent.offset.checked_add(child.rel_offset())
+}
 
-      mutable,
-      offset,
-      first: Cell::new(ptr::null()),
-      next: Cell::new(ptr::null()),
-      prev: Cell::new(ptr::null()),
+/// Convert an offset-bearing green child into a red element descriptor.
+fn describe_child(parent: &Arc<SyntaxNodeData>, index: usize, child: &GreenChild) -> Option<ElementDescriptor> {
+  let offset = child_offset(parent, child)?;
+  Some(ElementDescriptor {
+    parent: parent.clone(),
+    green: child.as_ref().to_owned(),
+    index,
+    offset,
+  })
+}
+
+/// Convert one green child into a typed red-node descriptor when it is a node.
+fn describe_node_child(parent: &Arc<SyntaxNodeData>, index: usize, child: &GreenChild) -> Option<NodeDescriptor> {
+  let NodeOrToken::Node(green) = child.as_ref() else {
+    return None;
+  };
+  Some(NodeDescriptor {
+    parent: parent.clone(),
+    green: green.clone(),
+    index,
+    offset: child_offset(parent, child)?,
+  })
+}
+
+/// Find the first node child from one edge without allocating intermediate cursors.
+fn boundary_node_descriptor(parent: &Arc<SyntaxNodeData>, direction: Direction) -> Option<NodeDescriptor> {
+  let child_count = parent.green.child_records().len();
+  let mut index = match direction {
+    Direction::Next => 0,
+    Direction::Prev => child_count.checked_sub(1)?,
+  };
+  loop {
+    let child = parent.green.child_records().get(index)?;
+    if let Some(descriptor) = describe_node_child(parent, index, child) {
+      return Some(descriptor);
+    }
+    index = match direction {
+      Direction::Next => index.checked_add(1)?,
+      Direction::Prev => index.checked_sub(1)?,
     };
-    unsafe {
-      if mutable {
-        let res_ptr: *const NodeData = &res;
-        match sll::init((*res_ptr).parent().map(|it| &it.first), res_ptr.as_ref().unwrap()) {
-          sll::AddToSllResult::AlreadyInSll(node) => {
-            if cfg!(debug_assertions) {
-              assert_eq!((*node).index(), (*res_ptr).index());
-              match ((*node).green(), (*res_ptr).green()) {
-                (NodeOrToken::Node(lhs), NodeOrToken::Node(rhs)) => {
-                  assert!(ptr::eq(lhs, rhs))
-                }
-                (NodeOrToken::Token(lhs), NodeOrToken::Token(rhs)) => {
-                  assert!(ptr::eq(lhs, rhs))
-                }
-                it => {
-                  panic!("node/token confusion: {:?}", it)
-                }
-              }
-            }
-
-            ManuallyDrop::into_inner(parent);
-            let res = node as *mut NodeData;
-            (*res).inc_rc();
-            return ptr::NonNull::new_unchecked(res);
-          }
-          it => {
-            let res = Box::into_raw(Box::new(res));
-            it.add_to_sll(res);
-            return ptr::NonNull::new_unchecked(res);
-          }
-        }
-      }
-      ptr::NonNull::new_unchecked(Box::into_raw(Box::new(res)))
-    }
   }
+}
 
-  #[inline]
-  fn inc_rc(&self) {
-    let rc = match self.rc.get().checked_add(1) {
-      Some(it) => it,
-      None => std::process::abort(),
+/// Describe one immediately adjacent element from shared node/token location metadata.
+fn sibling_element_descriptor(parent: Option<Arc<SyntaxNodeData>>, index: usize, direction: Direction) -> Option<ElementDescriptor> {
+  let parent = parent?;
+  let sibling_index = match direction {
+    Direction::Next => index.checked_add(1)?,
+    Direction::Prev => index.checked_sub(1)?,
+  };
+  let child = parent.green.child_records().get(sibling_index)?;
+  describe_child(&parent, sibling_index, child)
+}
+
+/// Iterate over an element and all sibling elements in one direction.
+fn sibling_elements(start: SyntaxElement, direction: Direction) -> impl Iterator<Item = SyntaxElement> {
+  iter::successors(Some(start), move |element| match direction {
+    Direction::Next => element.next_sibling_or_token(),
+    Direction::Prev => element.prev_sibling_or_token(),
+  })
+}
+
+/// Test whether one direct child satisfies the deterministic range-selection rule.
+fn query_selects_child(child_range: TextRange, query: TextRange) -> bool {
+  if query.is_empty() {
+    let offset = query.start();
+    child_range.start() == offset || (child_range.start() < offset && offset < child_range.end())
+  } else {
+    child_range.contains_range(query)
+  }
+}
+
+/// Validate a caller-provided absolute range before any query arithmetic.
+fn validate_query_range(valid: TextRange, requested: TextRange) -> Result<(), RangeError> {
+  if requested.start() > requested.end() {
+    return Err(RangeError::ReversedRange {
+      start: requested.start(),
+      end:   requested.end(),
+    });
+  }
+  if valid.contains_range(requested) {
+    Ok(())
+  } else {
+    Err(RangeError::RangeOutOfBounds {
+      requested,
+      valid,
+    })
+  }
+}
+
+/// Find the next token in one source-order direction, skipping empty subtrees.
+fn adjacent_token(mut current: SyntaxElement, direction: Direction) -> Option<SyntaxToken> {
+  loop {
+    let sibling = match direction {
+      Direction::Next => current.next_sibling_or_token(),
+      Direction::Prev => current.prev_sibling_or_token(),
     };
-    self.rc.set(rc)
-  }
-
-  #[inline]
-  fn dec_rc(&self) -> bool {
-    let rc = self.rc.get() - 1;
-    self.rc.set(rc);
-    rc == 0
-  }
-
-  #[inline]
-  fn key(&self) -> (ptr::NonNull<()>, TextSize) {
-    let ptr = match &self.green {
-      Green::Node {
-        ptr,
-      } => ptr.get().cast(),
-      Green::Token {
-        ptr,
-      } => ptr.cast(),
+    let Some(sibling) = sibling else {
+      current = SyntaxElement::from(current.parent()?);
+      continue;
     };
-    (ptr, self.offset())
-  }
-
-  #[inline]
-  fn parent_node(&self) -> Option<SyntaxNode> {
-    let parent = self.parent()?;
-    debug_assert!(matches!(parent.green, Green::Node { .. }));
-    parent.inc_rc();
-    Some(SyntaxNode {
-      ptr: ptr::NonNull::from(parent),
-    })
-  }
-
-  #[inline]
-  fn parent(&self) -> Option<&NodeData> {
-    self.parent.get().map(|it| unsafe { &*it.as_ptr() })
-  }
-
-  #[inline]
-  fn green(&self) -> GreenElementRef<'_> {
-    match &self.green {
-      Green::Node {
-        ptr,
-      } => GreenElementRef::Node(unsafe { &*ptr.get().as_ptr() }),
-      Green::Token {
-        ptr,
-      } => GreenElementRef::Token(unsafe { ptr.as_ref() }),
-    }
-  }
-  #[inline]
-  fn green_siblings(&self) -> slice::Iter<'_, GreenChild> {
-    match &self.parent().map(|it| &it.green) {
-      Some(Green::Node {
-        ptr,
-      }) => unsafe { &*ptr.get().as_ptr() }.children().raw,
-      Some(Green::Token {
-        ..
-      }) => {
-        debug_assert!(false);
-        [].iter()
-      }
-      None => [].iter(),
-    }
-  }
-  #[inline]
-  fn index(&self) -> u32 {
-    self.index.get()
-  }
-
-  #[inline]
-  fn offset(&self) -> TextSize {
-    if self.mutable { self.offset_mut() } else { self.offset }
-  }
-
-  #[cold]
-  fn offset_mut(&self) -> TextSize {
-    let mut res = TextSize::from(0);
-
-    let mut node = self;
-    while let Some(parent) = node.parent() {
-      let green = parent.green().into_node().unwrap();
-      res += green.children().raw.nth(node.index() as usize).unwrap().rel_offset();
-      node = parent;
-    }
-
-    res
-  }
-
-  #[inline]
-  fn text_range(&self) -> TextRange {
-    let offset = self.offset();
-    let len = self.green().text_len();
-    TextRange::at(offset, len)
-  }
-
-  #[inline]
-  fn kind(&self) -> SyntaxKind {
-    self.green().kind()
-  }
-
-  fn next_sibling(&self) -> Option<SyntaxNode> {
-    let siblings = self.green_siblings().enumerate();
-    let index = self.index() as usize;
-
-    siblings.skip(index + 1).find_map(|(index, child)| {
-      child.as_ref().into_node().and_then(|green| {
-        let parent = self.parent_node()?;
-        let offset = parent.offset() + child.rel_offset();
-        Some(SyntaxNode::new_child(green, parent, index as u32, offset))
-      })
-    })
-  }
-
-  fn next_sibling_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxNode> {
-    let siblings = self.green_siblings().enumerate();
-    let index = self.index() as usize;
-
-    siblings.skip(index + 1).find_map(|(index, child)| {
-      if !matcher(child.as_ref().kind()) {
-        return None;
-      }
-      child.as_ref().into_node().and_then(|green| {
-        let parent = self.parent_node()?;
-        let offset = parent.offset() + child.rel_offset();
-        Some(SyntaxNode::new_child(green, parent, index as u32, offset))
-      })
-    })
-  }
-
-  fn prev_sibling(&self) -> Option<SyntaxNode> {
-    let rev_siblings = self.green_siblings().enumerate().rev();
-    let index = rev_siblings.len().checked_sub(self.index() as usize)?;
-
-    rev_siblings.skip(index).find_map(|(index, child)| {
-      child.as_ref().into_node().and_then(|green| {
-        let parent = self.parent_node()?;
-        let offset = parent.offset() + child.rel_offset();
-        Some(SyntaxNode::new_child(green, parent, index as u32, offset))
-      })
-    })
-  }
-
-  fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-    let mut siblings = self.green_siblings().enumerate();
-    let index = self.index() as usize + 1;
-
-    siblings.nth(index).and_then(|(index, child)| {
-      let parent = self.parent_node()?;
-      let offset = parent.offset() + child.rel_offset();
-      Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
-    })
-  }
-
-  fn next_sibling_or_token_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxElement> {
-    let siblings = self.green_siblings().enumerate();
-    let index = self.index() as usize;
-
-    siblings.skip(index + 1).find_map(|(index, child)| {
-      if !matcher(child.as_ref().kind()) {
-        return None;
-      }
-      let parent = self.parent_node()?;
-      let offset = parent.offset() + child.rel_offset();
-      Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
-    })
-  }
-
-  fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
-    let mut siblings = self.green_siblings().enumerate();
-    let index = self.index().checked_sub(1)? as usize;
-
-    siblings.nth(index).and_then(|(index, child)| {
-      let parent = self.parent_node()?;
-      let offset = parent.offset() + child.rel_offset();
-      Some(SyntaxElement::new(child.as_ref(), parent, index as u32, offset))
-    })
-  }
-
-  fn detach(&self) {
-    assert!(self.mutable);
-    assert!(self.rc.get() > 0);
-    let parent_ptr = match self.parent.take() {
-      Some(parent) => parent,
-      None => return,
+    let token = match direction {
+      Direction::Next => sibling.first_token(),
+      Direction::Prev => sibling.last_token(),
     };
+    if token.is_some() {
+      return token;
+    }
+    current = sibling;
+  }
+}
 
-    sll::adjust(self, self.index() + 1, Delta::Sub(1));
-    let parent = unsafe { parent_ptr.as_ref() };
-    sll::unlink(&parent.first, self);
+/// Descend to the token nearest one edge of a subtree.
+fn boundary_token(mut current: Option<SyntaxElement>, direction: Direction) -> Option<SyntaxToken> {
+  loop {
+    current = match current? {
+      NodeOrToken::Node(node) => match direction {
+        Direction::Next => node.first_child_or_token(),
+        Direction::Prev => node.last_child_or_token(),
+      },
+      NodeOrToken::Token(token) => return Some(token),
+    };
+  }
+}
 
-    // Add strong ref to green
-    match self.green().to_owned() {
-      NodeOrToken::Node(it) => {
-        GreenNode::into_raw(it);
-      }
-      NodeOrToken::Token(it) => {
-        GreenToken::into_raw(it);
-      }
+/// Define the element-sibling navigation shared by node and token cursors.
+macro_rules! element_sibling_navigation {
+  () => {
+    /// Return the next direct sibling element.
+    pub fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
+      self.next_element_descriptor().map(ElementDescriptor::into_element)
     }
 
-    match parent.green() {
-      NodeOrToken::Node(green) => {
-        let green = green.remove_child(self.index() as usize);
-        unsafe { parent.respine(green) }
-      }
-      NodeOrToken::Token(_) => unreachable!(),
+    /// Return the next sibling element whose kind satisfies `matcher`.
+    pub fn next_sibling_or_token_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxElement> {
+      iter::successors(self.next_sibling_or_token(), SyntaxElement::next_sibling_or_token).find(|element| matcher(element.kind()))
     }
 
-    if parent.dec_rc() {
-      unsafe { free(parent_ptr) }
+    /// Return the previous direct sibling element.
+    pub fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
+      sibling_element_descriptor(self.payload.parent.clone(), self.payload.index, Direction::Prev).map(ElementDescriptor::into_element)
+    }
+  };
+}
+
+impl ElementDescriptor {
+  /// Allocate the variant-specific immutable red payload.
+  fn into_element(self) -> SyntaxElement {
+    match self.green {
+      NodeOrToken::Node(green) => SyntaxElement::Node(SyntaxNode {
+        payload: Arc::new(SyntaxNodeData {
+          parent: Some(self.parent),
+          green,
+          index: self.index,
+          offset: self.offset,
+        }),
+      }),
+      NodeOrToken::Token(green) => SyntaxElement::Token(SyntaxToken {
+        payload: Arc::new(SyntaxTokenData {
+          parent: Some(self.parent),
+          green,
+          index: self.index,
+          offset: self.offset,
+        }),
+      }),
     }
   }
-  fn attach_child(&self, index: usize, child: &NodeData) {
-    assert!(self.mutable && child.mutable && child.parent().is_none());
-    assert!(self.rc.get() > 0 && child.rc.get() > 0);
+}
 
-    child.index.set(index as u32);
-    child.parent.set(Some(self.into()));
-    self.inc_rc();
-
-    if !self.first.get().is_null() {
-      sll::adjust(unsafe { &*self.first.get() }, index as u32, Delta::Add(1));
-    }
-
-    match sll::link(&self.first, child) {
-      sll::AddToSllResult::AlreadyInSll(_) => {
-        panic!("Child already in sorted linked list")
-      }
-      it => it.add_to_sll(child),
-    }
-
-    match self.green() {
-      NodeOrToken::Node(green) => {
-        // Child is root, so it owns the green node. Steal it!
-        let child_green = match &child.green {
-          Green::Node {
-            ptr,
-          } => unsafe { GreenNode::from_raw(ptr.get()).into() },
-          Green::Token {
-            ptr,
-          } => unsafe { GreenToken::from_raw(*ptr).into() },
-        };
-
-        let green = green.insert_child(index, child_green);
-        unsafe { self.respine(green) };
-      }
-      NodeOrToken::Token(_) => unreachable!(),
+impl NodeDescriptor {
+  /// Allocate the immutable red-node payload described by this value.
+  fn into_node(self) -> SyntaxNode {
+    SyntaxNode {
+      payload: Arc::new(SyntaxNodeData {
+        parent: Some(self.parent),
+        green:  self.green,
+        index:  self.index,
+        offset: self.offset,
+      }),
     }
   }
-  unsafe fn respine(&self, mut new_green: GreenNode) {
-    unsafe {
-      let mut node = self;
-      loop {
-        let old_green = match &node.green {
-          Green::Node {
-            ptr,
-          } => ptr.replace(ptr::NonNull::from(&*new_green)),
-          Green::Token {
-            ..
-          } => unreachable!(),
-        };
-        match node.parent() {
-          Some(parent) => match parent.green() {
-            NodeOrToken::Node(parent_green) => {
-              new_green = parent_green.replace_child(node.index() as usize, new_green.into());
-              node = parent;
-            }
-            _ => unreachable!(),
-          },
-          None => {
-            mem::forget(new_green);
-            let _ = GreenNode::from_raw(old_green);
-            break;
-          }
-        }
+}
+
+/// Variant-specific access required to reuse a unique red payload allocation.
+trait ReusableCursor: Sized {
+  /// Immutable green handle stored by the payload.
+  type Green;
+  /// Variant-specific immutable red payload.
+  type Payload;
+
+  /// Mutably borrow the shared payload handle.
+  fn payload_mut(&mut self) -> &mut Arc<Self::Payload>;
+
+  /// Replace uniquely borrowed payload fields with an adjacent location.
+  fn update_payload(payload: &mut Self::Payload, parent: Arc<SyntaxNodeData>, green: Self::Green, index: usize, offset: TextSize);
+
+  /// Convert the cursor into the corresponding element variant.
+  fn into_element(self) -> SyntaxElement;
+
+  /// Allocate the corresponding element variant when the payload is shared.
+  fn allocate_element(parent: Arc<SyntaxNodeData>, green: Self::Green, index: usize, offset: TextSize) -> SyntaxElement;
+}
+
+/// Implement the identical safe allocation-reuse protocol for both cursor variants.
+macro_rules! implement_reusable_cursor {
+  ($cursor:ident, $payload:ident, $green:ty, $variant:ident) => {
+    impl ReusableCursor for $cursor {
+      type Green = $green;
+      type Payload = $payload;
+
+      fn payload_mut(&mut self) -> &mut Arc<Self::Payload> {
+        &mut self.payload
       }
+
+      fn update_payload(payload: &mut Self::Payload, parent: Arc<SyntaxNodeData>, green: Self::Green, index: usize, offset: TextSize) {
+        payload.parent = Some(parent);
+        payload.green = green;
+        payload.index = index;
+        payload.offset = offset;
+      }
+
+      fn into_element(self) -> SyntaxElement {
+        NodeOrToken::$variant(self)
+      }
+
+      fn allocate_element(parent: Arc<SyntaxNodeData>, green: Self::Green, index: usize, offset: TextSize) -> SyntaxElement {
+        NodeOrToken::$variant(Self {
+          payload: Arc::new($payload {
+            parent: Some(parent),
+            green,
+            index,
+            offset,
+          }),
+        })
+      }
+    }
+  };
+}
+
+implement_reusable_cursor!(SyntaxNode, SyntaxNodeData, GreenNode, Node);
+implement_reusable_cursor!(SyntaxToken, SyntaxTokenData, GreenToken, Token);
+
+/// Advance one same-variant cursor while reusing unique storage when possible.
+fn reuse_cursor<Cursor>(
+  mut cursor: Cursor,
+  parent: Arc<SyntaxNodeData>,
+  green: Cursor::Green,
+  index: usize,
+  offset: TextSize,
+) -> SyntaxElement
+where
+  Cursor: ReusableCursor,
+{
+  match Arc::get_mut(cursor.payload_mut()) {
+    Some(payload) => {
+      Cursor::update_payload(payload, parent, green, index, offset);
+      cursor.into_element()
+    }
+    None => Cursor::allocate_element(parent, green, index, offset),
+  }
+}
+
+/// Advance an element cursor, retaining allocation reuse only within the same variant.
+fn advance_element(current: SyntaxElement, descriptor: ElementDescriptor) -> SyntaxElement {
+  let ElementDescriptor {
+    parent,
+    green,
+    index,
+    offset,
+  } = descriptor;
+  match (current, green) {
+    (NodeOrToken::Node(node), NodeOrToken::Node(green)) => reuse_cursor(node, parent, green, index, offset),
+    (NodeOrToken::Token(token), NodeOrToken::Token(green)) => reuse_cursor(token, parent, green, index, offset),
+    (previous, green) => {
+      drop(previous);
+      ElementDescriptor {
+        parent,
+        green,
+        index,
+        offset,
+      }
+      .into_element()
     }
   }
 }
 
 impl SyntaxNode {
-  pub fn new_root(green: GreenNode) -> SyntaxNode {
-    let green = GreenNode::into_raw(green);
-    let green = Green::Node {
-      ptr: Cell::new(green)
-    };
-    SyntaxNode {
-      ptr: NodeData::new(None, 0, 0.into(), green, false),
+  /// Create a root cursor at absolute offset zero.
+  pub fn new_root(green: GreenNode) -> Self {
+    Self {
+      payload: Arc::new(SyntaxNodeData {
+        parent: None,
+        green,
+        index: 0,
+        offset: TextSize::default(),
+      }),
     }
   }
 
-  pub fn new_root_mut(green: GreenNode) -> SyntaxNode {
-    let green = GreenNode::into_raw(green);
-    let green = Green::Node {
-      ptr: Cell::new(green)
-    };
-    SyntaxNode {
-      ptr: NodeData::new(None, 0, 0.into(), green, true),
-    }
-  }
-
-  fn new_child(green: &GreenNodeData, parent: SyntaxNode, index: u32, offset: TextSize) -> SyntaxNode {
-    let mutable = parent.data().mutable;
-    let green = Green::Node {
-      ptr: Cell::new(green.into()),
-    };
-    SyntaxNode {
-      ptr: NodeData::new(Some(parent), index, offset, green, mutable),
-    }
-  }
-
-  pub fn is_mutable(&self) -> bool {
-    self.data().mutable
-  }
-
-  pub fn clone_for_update(&self) -> SyntaxNode {
-    assert!(!self.data().mutable);
-    match self.parent() {
-      Some(parent) => {
-        let parent = parent.clone_for_update();
-        SyntaxNode::new_child(self.green_ref(), parent, self.data().index(), self.offset())
-      }
-      None => SyntaxNode::new_root_mut(self.green_ref().to_owned()),
-    }
-  }
-
-  pub fn clone_subtree(&self) -> SyntaxNode {
-    SyntaxNode::new_root(self.green().into())
-  }
-
-  #[inline]
-  fn data(&self) -> &NodeData {
-    unsafe { self.ptr.as_ref() }
-  }
-
-  #[inline]
-  fn can_take_ptr(&self) -> bool {
-    self.data().rc.get() == 1 && !self.data().mutable
-  }
-
-  #[inline]
-  fn take_ptr(self) -> ptr::NonNull<NodeData> {
-    assert!(self.can_take_ptr());
-    let ret = self.ptr;
-    // don't change the refcount when self gets dropped
-    std::mem::forget(self);
-    ret
-  }
-
-  pub fn replace_with(&self, replacement: GreenNode) -> GreenNode {
-    assert_eq!(self.kind(), replacement.kind());
-    match &self.parent() {
-      None => replacement,
-      Some(parent) => {
-        let new_parent = parent
-          .green_ref()
-          .replace_child(self.data().index() as usize, replacement.into());
-        parent.replace_with(new_parent)
-      }
-    }
-  }
-
-  #[inline]
+  /// Return this node's raw syntax kind.
   pub fn kind(&self) -> SyntaxKind {
-    self.data().kind()
+    self.payload.green.kind()
   }
 
-  #[inline]
-  fn offset(&self) -> TextSize {
-    self.data().offset()
-  }
-
-  #[inline]
+  /// Return this node's absolute source range.
   pub fn text_range(&self) -> TextRange {
-    self.data().text_range()
+    validated_text_range(self.payload.offset, self.payload.green.text_len())
   }
 
-  #[inline]
+  /// Return this node's index in its parent, or zero for a root.
   pub fn index(&self) -> usize {
-    self.data().index() as usize
+    self.payload.index
   }
 
-  #[inline]
+  /// Return a chunked text view over this subtree.
   pub fn text(&self) -> SyntaxText {
     SyntaxText::new(self.clone())
   }
 
-  #[inline]
-  pub fn green(&self) -> Cow<'_, GreenNodeData> {
-    let green_ref = self.green_ref();
-    match self.data().mutable {
-      false => Cow::Borrowed(green_ref),
-      true => Cow::Owned(green_ref.to_owned()),
-    }
-  }
-  #[inline]
-  fn green_ref(&self) -> &GreenNodeData {
-    self.data().green().into_node().unwrap()
+  /// Borrow the immutable green node represented by this cursor.
+  pub fn green(&self) -> &GreenNode {
+    &self.payload.green
   }
 
-  #[inline]
-  pub fn parent(&self) -> Option<SyntaxNode> {
-    self.data().parent_node()
+  /// Return this node's parent.
+  pub fn parent(&self) -> Option<Self> {
+    self.payload.parent.clone().map(|payload| Self {
+      payload,
+    })
   }
 
-  #[inline]
-  pub fn ancestors(&self) -> impl Iterator<Item = SyntaxNode> + use<> {
-    iter::successors(Some(self.clone()), SyntaxNode::parent)
+  /// Iterate over this node and all of its ancestors.
+  pub fn ancestors(&self) -> impl Iterator<Item = Self> + use<> {
+    iter::successors(Some(self.clone()), Self::parent)
   }
 
-  #[inline]
+  /// Iterate over direct child nodes.
   pub fn children(&self) -> SyntaxNodeChildren {
     SyntaxNodeChildren::new(self.clone())
   }
 
-  #[inline]
+  /// Iterate over direct child nodes and tokens.
   pub fn children_with_tokens(&self) -> SyntaxElementChildren {
     SyntaxElementChildren::new(self.clone())
   }
 
-  pub fn first_child(&self) -> Option<SyntaxNode> {
-    self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
-      child
-        .as_ref()
-        .into_node()
-        .map(|green| SyntaxNode::new_child(green, self.clone(), index as u32, self.offset() + child.rel_offset()))
-    })
+  /// Return the first direct child node.
+  pub fn first_child(&self) -> Option<Self> {
+    boundary_node_descriptor(&self.payload, Direction::Next).map(NodeDescriptor::into_node)
   }
 
-  pub fn first_child_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxNode> {
-    self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
-      if !matcher(child.as_ref().kind()) {
-        return None;
-      }
-      child
-        .as_ref()
-        .into_node()
-        .map(|green| SyntaxNode::new_child(green, self.clone(), index as u32, self.offset() + child.rel_offset()))
-    })
+  /// Return the first direct child node whose kind satisfies `matcher`.
+  pub fn first_child_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<Self> {
+    self.children().find(|node| matcher(node.kind()))
   }
 
-  pub fn last_child(&self) -> Option<SyntaxNode> {
-    self.green_ref().children().raw.enumerate().rev().find_map(|(index, child)| {
-      child
-        .as_ref()
-        .into_node()
-        .map(|green| SyntaxNode::new_child(green, self.clone(), index as u32, self.offset() + child.rel_offset()))
-    })
+  /// Return the last direct child node.
+  pub fn last_child(&self) -> Option<Self> {
+    boundary_node_descriptor(&self.payload, Direction::Prev).map(NodeDescriptor::into_node)
   }
 
+  /// Return the first direct child element.
   pub fn first_child_or_token(&self) -> Option<SyntaxElement> {
     self
-      .green_ref()
-      .children()
-      .raw
-      .next()
-      .map(|child| SyntaxElement::new(child.as_ref(), self.clone(), 0, self.offset() + child.rel_offset()))
+      .payload
+      .green
+      .child_records()
+      .first()
+      .and_then(|child| describe_child(&self.payload, 0, child))
+      .map(ElementDescriptor::into_element)
   }
 
+  /// Return the first direct child element whose kind satisfies `matcher`.
   pub fn first_child_or_token_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxElement> {
-    self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
-      if !matcher(child.as_ref().kind()) {
-        return None;
-      }
-      Some(SyntaxElement::new(
-        child.as_ref(),
-        self.clone(),
-        index as u32,
-        self.offset() + child.rel_offset(),
-      ))
-    })
+    self.children_with_tokens().find(|element| matcher(element.kind()))
   }
 
+  /// Return the last direct child element.
   pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
     self
-      .green_ref()
-      .children()
-      .raw
+      .payload
+      .green
+      .child_records()
+      .iter()
       .enumerate()
       .next_back()
-      .map(|(index, child)| SyntaxElement::new(child.as_ref(), self.clone(), index as u32, self.offset() + child.rel_offset()))
+      .and_then(|(index, child)| describe_child(&self.payload, index, child))
+      .map(ElementDescriptor::into_element)
   }
 
-  // if possible (i.e. unshared), consume self and advance it to point to the next sibling
-  // this way, we can reuse the previously allocated buffer
-  pub fn to_next_sibling(self) -> Option<SyntaxNode> {
-    if !self.can_take_ptr() {
-      // cannot mutate in-place
-      return self.next_sibling();
+  /// Describe the next direct sibling element.
+  fn next_element_descriptor(&self) -> Option<ElementDescriptor> {
+    sibling_element_descriptor(self.payload.parent.clone(), self.payload.index, Direction::Next)
+  }
+
+  /// Describe the next sibling node, skipping tokens.
+  fn next_node_descriptor(&self) -> Option<NodeDescriptor> {
+    let parent = self.payload.parent.clone()?;
+    let next_index = self.payload.index.checked_add(1)?;
+    parent
+      .green
+      .child_records()
+      .iter()
+      .enumerate()
+      .skip(next_index)
+      .find_map(|(index, child)| describe_node_child(&parent, index, child))
+  }
+
+  /// Consume and advance this cursor, reusing a uniquely owned payload when possible.
+  pub(crate) fn into_next_sibling(mut self) -> Option<Self> {
+    let descriptor = self.next_node_descriptor()?;
+    if let Some(payload) = Arc::get_mut(&mut self.payload) {
+      payload.parent = Some(descriptor.parent);
+      payload.green = descriptor.green;
+      payload.index = descriptor.index;
+      payload.offset = descriptor.offset;
+      Some(self)
+    } else {
+      Some(descriptor.into_node())
     }
-
-    let mut ptr = self.take_ptr();
-    let data = unsafe { ptr.as_mut() };
-    assert!(data.rc.get() == 1);
-
-    let parent = data.parent_node()?;
-    let parent_offset = parent.offset();
-    let siblings = parent.green_ref().children().raw.enumerate();
-    let index = data.index() as usize;
-
-    siblings
-      .skip(index + 1)
-      .find_map(|(index, child)| {
-        child
-          .as_ref()
-          .into_node()
-          .map(|green| (green, index as u32, child.rel_offset()))
-      })
-      .map(|(green, index, rel_offset)| {
-        data.index.set(index);
-        data.offset = parent_offset + rel_offset;
-        data.green = Green::Node {
-          ptr: Cell::new(green.into()),
-        };
-        SyntaxNode {
-          ptr,
-        }
-      })
-      .or_else(|| {
-        data.dec_rc();
-        unsafe { free(ptr) };
-        None
-      })
   }
 
-  pub fn next_sibling(&self) -> Option<SyntaxNode> {
-    self.data().next_sibling()
+  /// Return the next sibling node, skipping tokens.
+  pub fn next_sibling(&self) -> Option<Self> {
+    self.next_node_descriptor().map(NodeDescriptor::into_node)
   }
 
-  pub fn next_sibling_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxNode> {
-    self.data().next_sibling_by_kind(matcher)
+  /// Return the next sibling node whose kind satisfies `matcher`.
+  pub fn next_sibling_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<Self> {
+    iter::successors(self.next_sibling(), Self::next_sibling).find(|node| matcher(node.kind()))
   }
 
-  pub fn prev_sibling(&self) -> Option<SyntaxNode> {
-    self.data().prev_sibling()
+  /// Return the previous sibling node, skipping tokens.
+  pub fn prev_sibling(&self) -> Option<Self> {
+    let parent = self.payload.parent.clone()?;
+    parent
+      .green
+      .child_records()
+      .iter()
+      .enumerate()
+      .take(self.payload.index)
+      .rev()
+      .find_map(|(index, child)| describe_node_child(&parent, index, child))
+      .map(NodeDescriptor::into_node)
   }
 
-  pub fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-    self.data().next_sibling_or_token()
-  }
+  element_sibling_navigation!();
 
-  pub fn next_sibling_or_token_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxElement> {
-    self.data().next_sibling_or_token_by_kind(matcher)
-  }
-
-  pub fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
-    self.data().prev_sibling_or_token()
-  }
-
+  /// Return the leftmost token in this subtree.
   pub fn first_token(&self) -> Option<SyntaxToken> {
-    self.first_child_or_token()?.first_token()
-  }
-  pub fn last_token(&self) -> Option<SyntaxToken> {
-    self.last_child_or_token()?.last_token()
+    boundary_token(self.first_child_or_token(), Direction::Next)
   }
 
-  #[inline]
-  pub fn siblings(&self, direction: Direction) -> impl Iterator<Item = SyntaxNode> + use<> {
+  /// Return the rightmost token in this subtree.
+  pub fn last_token(&self) -> Option<SyntaxToken> {
+    boundary_token(self.last_child_or_token(), Direction::Prev)
+  }
+
+  /// Iterate over this node and its siblings in `direction`.
+  pub fn siblings(&self, direction: Direction) -> impl Iterator<Item = Self> + use<> {
     iter::successors(Some(self.clone()), move |node| match direction {
       Direction::Next => node.next_sibling(),
       Direction::Prev => node.prev_sibling(),
     })
   }
 
-  #[inline]
+  /// Iterate over this element and its sibling elements in `direction`.
   pub fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> + use<> {
-    let me: SyntaxElement = self.clone().into();
-    iter::successors(Some(me), move |el| match direction {
-      Direction::Next => el.next_sibling_or_token(),
-      Direction::Prev => el.prev_sibling_or_token(),
-    })
+    sibling_elements(SyntaxElement::from(self.clone()), direction)
   }
 
-  #[inline]
-  pub fn descendants(&self) -> impl Iterator<Item = SyntaxNode> + use<> {
+  /// Iterate over this node and every descendant node in preorder.
+  pub fn descendants(&self) -> impl Iterator<Item = Self> + use<> {
     self.preorder().filter_map(|event| match event {
       WalkEvent::Enter(node) => Some(node),
       WalkEvent::Leave(_) => None,
     })
   }
 
-  #[inline]
+  /// Iterate over this node and every descendant node or token in preorder.
   pub fn descendants_with_tokens(&self) -> impl Iterator<Item = SyntaxElement> + use<> {
     self.preorder_with_tokens().filter_map(|event| match event {
-      WalkEvent::Enter(it) => Some(it),
+      WalkEvent::Enter(element) => Some(element),
       WalkEvent::Leave(_) => None,
     })
   }
 
-  #[inline]
+  /// Traverse this subtree in node-only preorder.
   pub fn preorder(&self) -> Preorder {
     Preorder::new(self.clone())
   }
 
-  #[inline]
+  /// Traverse this subtree in preorder including tokens.
   pub fn preorder_with_tokens(&self) -> PreorderWithTokens {
     PreorderWithTokens::new(self.clone())
   }
 
-  pub fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken> {
-    // TODO: this could be faster if we first drill-down to node, and only
-    // then switch to token search. We should also replace explicit
-    // recursion with a loop.
-    let range = self.text_range();
-    assert!(
-      range.start() <= offset && offset <= range.end(),
-      "Bad offset: range {:?} offset {:?}",
-      range,
-      offset
-    );
-    if range.is_empty() {
-      return TokenAtOffset::None;
+  /// Find the token or adjacent token pair touching an absolute offset.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RangeError::OffsetOutOfBounds`] when `offset` is outside this node's closed range.
+  pub fn token_at_offset(&self, offset: TextSize) -> Result<TokenAtOffset<SyntaxToken>, RangeError> {
+    let valid = self.text_range();
+    if !valid.contains_inclusive(offset) {
+      return Err(RangeError::OffsetOutOfBounds {
+        offset,
+        valid,
+      });
+    }
+    if valid.is_empty() {
+      return Ok(TokenAtOffset::None);
     }
 
-    let mut children = self.children_with_tokens().filter(|child| {
-      let child_range = child.text_range();
-      !child_range.is_empty() && (child_range.start() <= offset && offset <= child_range.end())
-    });
-
-    let left = children.next().unwrap();
-    let right = children.next();
-    assert!(children.next().is_none());
-
-    if let Some(right) = right {
-      match (left.token_at_offset(offset), right.token_at_offset(offset)) {
-        (TokenAtOffset::Single(left), TokenAtOffset::Single(right)) => TokenAtOffset::Between(left, right),
-        _ => unreachable!(),
-      }
-    } else {
-      left.token_at_offset(offset)
-    }
+    let mut touching = self
+      .descendants_with_tokens()
+      .filter_map(NodeOrToken::into_token)
+      .filter(|token| {
+        let token_range = token.text_range();
+        !token_range.is_empty() && token_range.contains_inclusive(offset)
+      });
+    let first = touching.next();
+    let second = touching.next();
+    Ok(match (first, second) {
+      (None, _) => TokenAtOffset::None,
+      (Some(token), None) => TokenAtOffset::Single(token),
+      (Some(left), Some(right)) => TokenAtOffset::Between(left, right),
+    })
   }
 
-  pub fn covering_element(&self, range: TextRange) -> SyntaxElement {
-    let mut res: SyntaxElement = self.clone().into();
+  /// Return the deepest descendant that fully contains an absolute range.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RangeError::RangeOutOfBounds`] when `range` is not contained by this node.
+  pub fn covering_element(&self, range: TextRange) -> Result<SyntaxElement, RangeError> {
+    let valid = self.text_range();
+    validate_query_range(valid, range)?;
+    let mut current = SyntaxElement::from(self.clone());
     loop {
-      assert!(
-        res.text_range().contains_range(range),
-        "Bad range: node range {:?}, range {:?}",
-        res.text_range(),
-        range,
-      );
-      res = match &res {
-        NodeOrToken::Token(_) => return res,
-        NodeOrToken::Node(node) => match node.child_or_token_at_range(range) {
-          Some(it) => it,
-          None => return res,
+      current = match current {
+        NodeOrToken::Token(token) => return Ok(NodeOrToken::Token(token)),
+        NodeOrToken::Node(node) => match node.child_or_token_at_range(range)? {
+          Some(child) => child,
+          None => return Ok(NodeOrToken::Node(node)),
         },
       };
     }
   }
 
-  pub fn child_or_token_at_range(&self, range: TextRange) -> Option<SyntaxElement> {
-    let rel_range = range - self.offset();
-    self
-      .green_ref()
-      .child_at_range(rel_range)
-      .map(|(index, rel_offset, green)| SyntaxElement::new(green, self.clone(), index as u32, self.offset() + rel_offset))
-  }
+  /// Return the direct child that fully contains an absolute range.
+  ///
+  /// Valid ranges spanning multiple children return `Ok(None)`. Empty internal boundaries are
+  /// right-biased; an empty range at this node's end selects its last child.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RangeError::RangeOutOfBounds`] when `range` is not contained by this node.
+  pub fn child_or_token_at_range(&self, range: TextRange) -> Result<Option<SyntaxElement>, RangeError> {
+    let valid = self.text_range();
+    validate_query_range(valid, range)?;
 
-  pub fn splice_children<I: IntoIterator<Item = SyntaxElement>>(&self, to_delete: Range<usize>, to_insert: I) {
-    assert!(self.data().mutable, "immutable tree: {}", self);
-    let children_to_detach = self
-      .children_with_tokens()
-      .enumerate()
-      .filter_map(|(index, child)| to_delete.contains(&index).then_some(child))
-      .collect::<Vec<_>>();
-    for child in children_to_detach {
-      child.detach();
+    if range.is_empty() && range.start() == valid.end() {
+      return Ok(self.last_child_or_token());
     }
-    for (index, child) in (to_delete.start..).zip(to_insert) {
-      self.attach_child(index, child);
+    for child in self.children_with_tokens() {
+      if query_selects_child(child.text_range(), range) {
+        return Ok(Some(child));
+      }
     }
+    Ok(None)
   }
 
-  pub fn detach(&self) {
-    assert!(self.data().mutable, "immutable tree: {}", self);
-    self.data().detach()
+  /// Return an independent root cursor sharing this subtree's green allocation.
+  pub fn clone_subtree(&self) -> Self {
+    Self::new_root(self.payload.green.clone())
   }
 
-  fn attach_child(&self, index: usize, child: SyntaxElement) {
-    assert!(self.data().mutable, "immutable tree: {}", self);
-    child.detach();
-    let data = match &child {
-      NodeOrToken::Node(it) => it.data(),
-      NodeOrToken::Token(it) => it.data(),
-    };
-    self.data().attach_child(index, data)
+  /// Functionally replace this node and rebuild its ancestor spine.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`GreenError::KindMismatch`] before rebuilding when `replacement` changes this node's
+  /// kind, or propagates a green construction failure.
+  pub fn replace_with(&self, replacement: GreenNode) -> Result<GreenNode, GreenError> {
+    if replacement.kind() != self.kind() {
+      return Err(GreenError::KindMismatch {
+        expected: self.kind(),
+        actual:   replacement.kind(),
+      });
+    }
+    let mut current = self.clone();
+    let mut rebuilt = replacement;
+    while let Some(parent) = current.parent() {
+      rebuilt = parent.green().replace_child(current.index(), GreenElement::from(rebuilt))?;
+      current = parent;
+    }
+    Ok(rebuilt)
+  }
+
+  /// Return the top green root allocation and complete child-index path for editor lookup.
+  pub(crate) fn root_locator(&self) -> (GreenNode, Vec<usize>) {
+    let mut current = self.clone();
+    let mut reverse_path = Vec::new();
+    while let Some(parent) = current.parent() {
+      reverse_path.push(current.index());
+      current = parent;
+    }
+    reverse_path.reverse();
+    (current.green().clone(), reverse_path)
   }
 }
 
 impl SyntaxToken {
-  fn new(green: &GreenTokenData, parent: SyntaxNode, index: u32, offset: TextSize) -> SyntaxToken {
-    let mutable = parent.data().mutable;
-    let green = Green::Token {
-      ptr: green.into()
-    };
-    SyntaxToken {
-      ptr: NodeData::new(Some(parent), index, offset, green, mutable),
-    }
-  }
-
-  #[inline]
-  fn data(&self) -> &NodeData {
-    unsafe { self.ptr.as_ref() }
-  }
-
-  #[inline]
-  fn can_take_ptr(&self) -> bool {
-    self.data().rc.get() == 1 && !self.data().mutable
-  }
-
-  #[inline]
-  fn take_ptr(self) -> ptr::NonNull<NodeData> {
-    assert!(self.can_take_ptr());
-    let ret = self.ptr;
-    // don't change the refcount when self gets dropped
-    std::mem::forget(self);
-    ret
-  }
-
-  pub fn replace_with(&self, replacement: GreenToken) -> GreenNode {
-    assert_eq!(self.kind(), replacement.kind());
-    let parent = self.parent().unwrap();
-    let me: u32 = self.data().index();
-
-    let new_parent = parent.green_ref().replace_child(me as usize, replacement.into());
-    parent.replace_with(new_parent)
-  }
-
-  #[inline]
+  /// Return this token's raw syntax kind.
   pub fn kind(&self) -> SyntaxKind {
-    self.data().kind()
+    self.payload.green.kind()
   }
 
-  #[inline]
+  /// Return this token's absolute source range.
   pub fn text_range(&self) -> TextRange {
-    self.data().text_range()
+    validated_text_range(self.payload.offset, self.payload.green.text_len())
   }
 
-  #[inline]
+  /// Return this token's index in its parent.
   pub fn index(&self) -> usize {
-    self.data().index() as usize
+    self.payload.index
   }
 
-  #[inline]
+  /// Borrow this token's exact UTF-8 text.
   pub fn text(&self) -> &str {
-    match self.data().green().as_token() {
-      Some(it) => it.text(),
-      None => {
-        debug_assert!(
-          false,
-          "corrupted tree: a node thinks it is a token: {:?}",
-          self.data().green().as_node().unwrap().to_string()
-        );
-        ""
-      }
-    }
+    self.payload.green.text()
   }
 
-  #[inline]
-  pub fn green(&self) -> &GreenTokenData {
-    self.data().green().into_token().unwrap()
+  /// Borrow the immutable green token represented by this cursor.
+  pub fn green(&self) -> &GreenToken {
+    &self.payload.green
   }
 
-  #[inline]
+  /// Return this token's parent node.
   pub fn parent(&self) -> Option<SyntaxNode> {
-    self.data().parent_node()
-  }
-
-  #[inline]
-  pub fn ancestors(&self) -> impl Iterator<Item = SyntaxNode> + use<> {
-    std::iter::successors(self.parent(), SyntaxNode::parent)
-  }
-
-  pub fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-    self.data().next_sibling_or_token()
-  }
-
-  pub fn next_sibling_or_token_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxElement> {
-    self.data().next_sibling_or_token_by_kind(matcher)
-  }
-
-  pub fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
-    self.data().prev_sibling_or_token()
-  }
-
-  #[inline]
-  pub fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> + use<> {
-    let me: SyntaxElement = self.clone().into();
-    iter::successors(Some(me), move |el| match direction {
-      Direction::Next => el.next_sibling_or_token(),
-      Direction::Prev => el.prev_sibling_or_token(),
+    self.payload.parent.clone().map(|payload| SyntaxNode {
+      payload,
     })
   }
 
-  pub fn next_token(&self) -> Option<SyntaxToken> {
-    match self.next_sibling_or_token() {
-      Some(element) => element.first_token(),
-      None => self
-        .ancestors()
-        .find_map(|it| it.next_sibling_or_token())
-        .and_then(|element| element.first_token()),
-    }
-  }
-  pub fn prev_token(&self) -> Option<SyntaxToken> {
-    match self.prev_sibling_or_token() {
-      Some(element) => element.last_token(),
-      None => self
-        .ancestors()
-        .find_map(|it| it.prev_sibling_or_token())
-        .and_then(|element| element.last_token()),
-    }
+  /// Iterate over this token's parent and all higher ancestors.
+  pub fn ancestors(&self) -> impl Iterator<Item = SyntaxNode> + use<> {
+    iter::successors(self.parent(), SyntaxNode::parent)
   }
 
-  pub fn detach(&self) {
-    assert!(self.data().mutable, "immutable tree: {}", self);
-    self.data().detach()
+  /// Describe the next direct sibling element.
+  fn next_element_descriptor(&self) -> Option<ElementDescriptor> {
+    sibling_element_descriptor(self.payload.parent.clone(), self.payload.index, Direction::Next)
+  }
+
+  element_sibling_navigation!();
+
+  /// Iterate over this token and its sibling elements in `direction`.
+  pub fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> + use<> {
+    sibling_elements(SyntaxElement::from(self.clone()), direction)
+  }
+
+  /// Return the next token in source order.
+  pub fn next_token(&self) -> Option<Self> {
+    adjacent_token(SyntaxElement::from(self.clone()), Direction::Next)
+  }
+
+  /// Return the previous token in source order.
+  pub fn prev_token(&self) -> Option<Self> {
+    adjacent_token(SyntaxElement::from(self.clone()), Direction::Prev)
+  }
+
+  /// Functionally replace this token and rebuild its ancestor spine.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`GreenError::KindMismatch`] before rebuilding when `replacement` changes this
+  /// token's kind, or propagates a green construction failure.
+  pub fn replace_with(&self, replacement: GreenToken) -> Result<GreenNode, GreenError> {
+    if replacement.kind() != self.kind() {
+      return Err(GreenError::KindMismatch {
+        expected: self.kind(),
+        actual:   replacement.kind(),
+      });
+    }
+    let parent = self.parent().ok_or(GreenError::ChildIndexOutOfBounds {
+      index:       self.index(),
+      child_count: 0,
+    })?;
+    let rebuilt = parent.green().replace_child(self.index(), GreenElement::from(replacement))?;
+    parent.replace_with(rebuilt)
+  }
+
+  /// Return the top green root allocation and complete child-index path for editor lookup.
+  pub(crate) fn root_locator(&self) -> Option<(GreenNode, Vec<usize>)> {
+    let mut current = self.parent()?;
+    let mut reverse_path = vec![self.index()];
+    while let Some(parent) = current.parent() {
+      reverse_path.push(current.index());
+      current = parent;
+    }
+    reverse_path.reverse();
+    Some((current.green().clone(), reverse_path))
   }
 }
 
 impl SyntaxElement {
-  fn new(element: GreenElementRef<'_>, parent: SyntaxNode, index: u32, offset: TextSize) -> SyntaxElement {
-    match element {
-      NodeOrToken::Node(node) => SyntaxNode::new_child(node, parent, index, offset).into(),
-      NodeOrToken::Token(token) => SyntaxToken::new(token, parent, index, offset).into(),
-    }
-  }
-
-  #[inline]
+  /// Return this element's absolute source range.
   pub fn text_range(&self) -> TextRange {
-    match self {
-      NodeOrToken::Node(it) => it.text_range(),
-      NodeOrToken::Token(it) => it.text_range(),
-    }
+    self.either(SyntaxNode::text_range, SyntaxToken::text_range)
   }
 
-  #[inline]
+  /// Return this element's index in its parent, or zero for a root node.
   pub fn index(&self) -> usize {
-    match self {
-      NodeOrToken::Node(it) => it.index(),
-      NodeOrToken::Token(it) => it.index(),
-    }
+    self.either(SyntaxNode::index, SyntaxToken::index)
   }
 
-  #[inline]
+  /// Return this element's raw syntax kind.
   pub fn kind(&self) -> SyntaxKind {
-    match self {
-      NodeOrToken::Node(it) => it.kind(),
-      NodeOrToken::Token(it) => it.kind(),
-    }
+    self.either(SyntaxNode::kind, SyntaxToken::kind)
   }
 
-  #[inline]
+  /// Return this element's parent node.
   pub fn parent(&self) -> Option<SyntaxNode> {
-    match self {
-      NodeOrToken::Node(it) => it.parent(),
-      NodeOrToken::Token(it) => it.parent(),
-    }
+    self.either(SyntaxNode::parent, SyntaxToken::parent)
   }
 
-  #[inline]
+  /// Iterate over this node and its ancestors, or a token's parent ancestors.
   pub fn ancestors(&self) -> impl Iterator<Item = SyntaxNode> + use<> {
     let first = match self {
-      NodeOrToken::Node(it) => Some(it.clone()),
-      NodeOrToken::Token(it) => it.parent(),
+      NodeOrToken::Node(node) => Some(node.clone()),
+      NodeOrToken::Token(token) => token.parent(),
     };
     iter::successors(first, SyntaxNode::parent)
   }
 
+  /// Return this element's leftmost token.
   pub fn first_token(&self) -> Option<SyntaxToken> {
-    match self {
-      NodeOrToken::Node(it) => it.first_token(),
-      NodeOrToken::Token(it) => Some(it.clone()),
-    }
+    self.either(SyntaxNode::first_token, |token| Some(token.clone()))
   }
+
+  /// Return this element's rightmost token.
   pub fn last_token(&self) -> Option<SyntaxToken> {
-    match self {
-      NodeOrToken::Node(it) => it.last_token(),
-      NodeOrToken::Token(it) => Some(it.clone()),
-    }
+    self.either(SyntaxNode::last_token, |token| Some(token.clone()))
   }
 
-  pub fn next_sibling_or_token(&self) -> Option<SyntaxElement> {
-    match self {
-      NodeOrToken::Node(it) => it.next_sibling_or_token(),
-      NodeOrToken::Token(it) => it.next_sibling_or_token(),
-    }
+  /// Return the next direct sibling element.
+  pub fn next_sibling_or_token(&self) -> Option<Self> {
+    self.either(SyntaxNode::next_sibling_or_token, SyntaxToken::next_sibling_or_token)
   }
 
-  fn can_take_ptr(&self) -> bool {
-    match self {
-      NodeOrToken::Node(it) => it.can_take_ptr(),
-      NodeOrToken::Token(it) => it.can_take_ptr(),
-    }
+  /// Consume and advance this element, reusing a same-variant uniquely owned payload when possible.
+  pub(crate) fn into_next_sibling_or_token(self) -> Option<Self> {
+    let descriptor = match &self {
+      NodeOrToken::Node(node) => node.next_element_descriptor(),
+      NodeOrToken::Token(token) => token.next_element_descriptor(),
+    }?;
+    Some(advance_element(self, descriptor))
   }
 
-  fn take_ptr(self) -> ptr::NonNull<NodeData> {
-    match self {
-      NodeOrToken::Node(it) => it.take_ptr(),
-      NodeOrToken::Token(it) => it.take_ptr(),
-    }
+  /// Return the next sibling element whose kind satisfies `matcher`.
+  pub fn next_sibling_or_token_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<Self> {
+    iter::successors(self.next_sibling_or_token(), Self::next_sibling_or_token).find(|element| matcher(element.kind()))
   }
 
-  // if possible (i.e. unshared), consume self and advance it to point to the next sibling
-  // this way, we can reuse the previously allocated buffer
-  pub fn to_next_sibling_or_token(self) -> Option<SyntaxElement> {
-    if !self.can_take_ptr() {
-      // cannot mutate in-place
-      return self.next_sibling_or_token();
-    }
-
-    let mut ptr = self.take_ptr();
-    let data = unsafe { ptr.as_mut() };
-
-    let parent = data.parent_node()?;
-    let parent_offset = parent.offset();
-    let siblings = parent.green_ref().children().raw.enumerate();
-    let index = data.index() as usize;
-
-    siblings
-      .skip(index + 1)
-      .map(|(index, green)| {
-        data.index.set(index as u32);
-        data.offset = parent_offset + green.rel_offset();
-
-        match green.as_ref() {
-          NodeOrToken::Node(node) => {
-            data.green = Green::Node {
-              ptr: Cell::new(node.into()),
-            };
-            Some(SyntaxElement::Node(SyntaxNode {
-              ptr,
-            }))
-          }
-          NodeOrToken::Token(token) => {
-            data.green = Green::Token {
-              ptr: token.into()
-            };
-            Some(SyntaxElement::Token(SyntaxToken {
-              ptr,
-            }))
-          }
-        }
-      })
-      .next()
-      .flatten()
-      .or_else(|| {
-        data.dec_rc();
-        unsafe { free(ptr) };
-        None
-      })
+  /// Return the previous direct sibling element.
+  pub fn prev_sibling_or_token(&self) -> Option<Self> {
+    self.either(SyntaxNode::prev_sibling_or_token, SyntaxToken::prev_sibling_or_token)
   }
 
-  pub fn next_sibling_or_token_by_kind(&self, matcher: &impl Fn(SyntaxKind) -> bool) -> Option<SyntaxElement> {
-    match self {
-      NodeOrToken::Node(it) => it.next_sibling_or_token_by_kind(matcher),
-      NodeOrToken::Token(it) => it.next_sibling_or_token_by_kind(matcher),
-    }
-  }
-
-  pub fn prev_sibling_or_token(&self) -> Option<SyntaxElement> {
-    match self {
-      NodeOrToken::Node(it) => it.prev_sibling_or_token(),
-      NodeOrToken::Token(it) => it.prev_sibling_or_token(),
-    }
-  }
-
-  fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken> {
-    assert!(self.text_range().start() <= offset && offset <= self.text_range().end());
-    match self {
-      NodeOrToken::Token(token) => TokenAtOffset::Single(token.clone()),
-      NodeOrToken::Node(node) => node.token_at_offset(offset),
-    }
-  }
-
-  pub fn detach(&self) {
-    match self {
-      NodeOrToken::Node(it) => it.detach(),
-      NodeOrToken::Token(it) => it.detach(),
-    }
+  /// Clone the represented immutable green handle.
+  pub(crate) fn green_owned(&self) -> GreenElement {
+    self.either(
+      |node| GreenElement::from(node.green().clone()),
+      |token| GreenElement::from(token.green().clone()),
+    )
   }
 }
 
-// region: impls
-
-// Identity semantics for hash & eq
 impl PartialEq for SyntaxNode {
-  #[inline]
-  fn eq(&self, other: &SyntaxNode) -> bool {
-    self.data().key() == other.data().key()
+  fn eq(&self, other: &Self) -> bool {
+    self.payload.offset == other.payload.offset && self.payload.green.ptr_eq(&other.payload.green)
   }
 }
 
 impl Eq for SyntaxNode {}
 
 impl Hash for SyntaxNode {
-  #[inline]
-  fn hash<H: Hasher>(&self, state: &mut H) {
-    self.data().key().hash(state);
+  fn hash<HasherType: Hasher>(&self, state: &mut HasherType) {
+    self.payload.green.hash_identity(state);
+    self.payload.offset.hash(state);
   }
 }
 
 impl fmt::Debug for SyntaxNode {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("SyntaxNode")
-      .field("kind", &self.kind())
-      .field("text_range", &self.text_range())
-      .finish()
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    crate::debug::write(crate::debug::DebugTarget::SyntaxNode(self), formatter)
   }
 }
 
 impl fmt::Display for SyntaxNode {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    self
-      .preorder_with_tokens()
-      .filter_map(|event| match event {
-        WalkEvent::Enter(NodeOrToken::Token(token)) => Some(token),
-        _ => None,
-      })
-      .try_for_each(|it| fmt::Display::fmt(&it, f))
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    for event in self.preorder_with_tokens() {
+      if let WalkEvent::Enter(NodeOrToken::Token(token)) = event {
+        fmt::Display::fmt(&token, formatter)?;
+      }
+    }
+    Ok(())
   }
 }
 
-// Identity semantics for hash & eq
 impl PartialEq for SyntaxToken {
-  #[inline]
-  fn eq(&self, other: &SyntaxToken) -> bool {
-    self.data().key() == other.data().key()
+  fn eq(&self, other: &Self) -> bool {
+    self.payload.offset == other.payload.offset && self.payload.green.ptr_eq(&other.payload.green)
   }
 }
 
 impl Eq for SyntaxToken {}
 
 impl Hash for SyntaxToken {
-  #[inline]
-  fn hash<H: Hasher>(&self, state: &mut H) {
-    self.data().key().hash(state);
+  fn hash<HasherType: Hasher>(&self, state: &mut HasherType) {
+    self.payload.green.hash_identity(state);
+    self.payload.offset.hash(state);
+  }
+}
+
+impl fmt::Debug for SyntaxToken {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    crate::debug::write(crate::debug::DebugTarget::SyntaxToken(self), formatter)
   }
 }
 
 impl fmt::Display for SyntaxToken {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    fmt::Display::fmt(self.text(), f)
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fmt::Display::fmt(self.text(), formatter)
   }
 }
 
 impl From<SyntaxNode> for SyntaxElement {
-  #[inline]
-  fn from(node: SyntaxNode) -> SyntaxElement {
+  fn from(node: SyntaxNode) -> Self {
     NodeOrToken::Node(node)
   }
 }
 
 impl From<SyntaxToken> for SyntaxElement {
-  #[inline]
-  fn from(token: SyntaxToken) -> SyntaxElement {
+  fn from(token: SyntaxToken) -> Self {
     NodeOrToken::Token(token)
   }
 }
 
-// endregion
-
-// region: iterators
-
-#[derive(Clone, Debug)]
-pub struct SyntaxNodeChildren {
-  parent:           SyntaxNode,
-  next:             Option<SyntaxNode>,
-  next_initialized: bool,
-}
-
-impl SyntaxNodeChildren {
-  fn new(parent: SyntaxNode) -> SyntaxNodeChildren {
-    SyntaxNodeChildren {
-      parent,
-      next: None,
-      next_initialized: false,
-    }
-  }
-
-  pub fn by_kind<F: Fn(SyntaxKind) -> bool>(self, matcher: F) -> SyntaxNodeChildrenByKind<F> {
-    if !self.next_initialized {
-      SyntaxNodeChildrenByKind {
-        next: self.parent.first_child_by_kind(&matcher),
-        matcher,
-      }
-    } else {
-      SyntaxNodeChildrenByKind {
-        next: self.next.and_then(|node| {
-          if matcher(node.kind()) {
-            Some(node)
-          } else {
-            node.next_sibling_by_kind(&matcher)
-          }
-        }),
-        matcher,
-      }
-    }
-  }
-}
-
-impl Iterator for SyntaxNodeChildren {
-  type Item = SyntaxNode;
-  fn next(&mut self) -> Option<SyntaxNode> {
-    if !self.next_initialized {
-      self.next = self.parent.first_child();
-      self.next_initialized = true;
-    } else {
-      self.next = self.next.take().and_then(|next| next.to_next_sibling());
-    }
-
-    self.next.clone()
-  }
-}
-
-#[derive(Clone, Debug)]
-pub struct SyntaxNodeChildrenByKind<F: Fn(SyntaxKind) -> bool> {
-  next:    Option<SyntaxNode>,
-  matcher: F,
-}
-
-impl<F: Fn(SyntaxKind) -> bool> Iterator for SyntaxNodeChildrenByKind<F> {
-  type Item = SyntaxNode;
-  fn next(&mut self) -> Option<SyntaxNode> {
-    self.next.take().inspect(|next| {
-      self.next = next.next_sibling_by_kind(&self.matcher);
-    })
-  }
-}
-
-#[derive(Clone, Debug)]
-pub struct SyntaxElementChildren {
-  parent:           SyntaxNode,
-  next:             Option<SyntaxElement>,
-  next_initialized: bool,
-}
-
-impl SyntaxElementChildren {
-  fn new(parent: SyntaxNode) -> SyntaxElementChildren {
-    SyntaxElementChildren {
-      parent,
-      next: None,
-      next_initialized: false,
-    }
-  }
-
-  pub fn by_kind<F: Fn(SyntaxKind) -> bool>(self, matcher: F) -> SyntaxElementChildrenByKind<F> {
-    if !self.next_initialized {
-      SyntaxElementChildrenByKind {
-        next: self.parent.first_child_or_token_by_kind(&matcher),
-        matcher,
-      }
-    } else {
-      SyntaxElementChildrenByKind {
-        next: self.next.and_then(|node| {
-          if matcher(node.kind()) {
-            Some(node)
-          } else {
-            node.next_sibling_or_token_by_kind(&matcher)
-          }
-        }),
-        matcher,
-      }
-    }
-  }
-}
-
-impl Iterator for SyntaxElementChildren {
-  type Item = SyntaxElement;
-  fn next(&mut self) -> Option<SyntaxElement> {
-    if !self.next_initialized {
-      self.next = self.parent.first_child_or_token();
-      self.next_initialized = true;
-    } else {
-      self.next = self.next.take().and_then(|next| next.to_next_sibling_or_token());
-    }
-
-    self.next.clone()
-  }
-}
-
-#[derive(Clone, Debug)]
-pub struct SyntaxElementChildrenByKind<F: Fn(SyntaxKind) -> bool> {
-  next:    Option<SyntaxElement>,
-  matcher: F,
-}
-
-impl<F: Fn(SyntaxKind) -> bool> Iterator for SyntaxElementChildrenByKind<F> {
-  type Item = SyntaxElement;
-  fn next(&mut self) -> Option<SyntaxElement> {
-    self.next.take().inspect(|next| {
-      self.next = next.next_sibling_or_token_by_kind(&self.matcher);
-    })
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct Preorder {
-  start:        SyntaxNode,
-  next:         Option<WalkEvent<SyntaxNode>>,
-  skip_subtree: bool,
-}
-
-impl Preorder {
-  fn new(start: SyntaxNode) -> Preorder {
-    let next = Some(WalkEvent::Enter(start.clone()));
-    Preorder {
-      start,
-      next,
-      skip_subtree: false,
-    }
-  }
-
-  pub fn skip_subtree(&mut self) {
-    self.skip_subtree = true;
-  }
-
-  #[cold]
-  fn do_skip(&mut self) {
-    self.next = self.next.take().map(|next| match next {
-      WalkEvent::Enter(first_child) => WalkEvent::Leave(first_child.parent().unwrap()),
-      WalkEvent::Leave(parent) => WalkEvent::Leave(parent),
-    })
-  }
-}
-
-impl Iterator for Preorder {
-  type Item = WalkEvent<SyntaxNode>;
-
-  fn next(&mut self) -> Option<WalkEvent<SyntaxNode>> {
-    if self.skip_subtree {
-      self.do_skip();
-      self.skip_subtree = false;
-    }
-    let next = self.next.take();
-    self.next = next.as_ref().and_then(|next| {
-      Some(match next {
-        WalkEvent::Enter(node) => match node.first_child() {
-          Some(child) => WalkEvent::Enter(child),
-          None => WalkEvent::Leave(node.clone()),
-        },
-        WalkEvent::Leave(node) => {
-          if node == &self.start {
-            return None;
-          }
-          match node.next_sibling() {
-            Some(sibling) => WalkEvent::Enter(sibling),
-            None => WalkEvent::Leave(node.parent()?),
-          }
-        }
-      })
-    });
-    next
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct PreorderWithTokens {
-  start:        SyntaxElement,
-  next:         Option<WalkEvent<SyntaxElement>>,
-  skip_subtree: bool,
-}
-
-impl PreorderWithTokens {
-  fn new(start: SyntaxNode) -> PreorderWithTokens {
-    let next = Some(WalkEvent::Enter(start.clone().into()));
-    PreorderWithTokens {
-      start: start.into(),
-      next,
-      skip_subtree: false,
-    }
-  }
-
-  pub fn skip_subtree(&mut self) {
-    self.skip_subtree = true;
-  }
-
-  #[cold]
-  fn do_skip(&mut self) {
-    self.next = self.next.take().map(|next| match next {
-      WalkEvent::Enter(first_child) => WalkEvent::Leave(first_child.parent().unwrap().into()),
-      WalkEvent::Leave(parent) => WalkEvent::Leave(parent),
-    })
-  }
-}
-
-impl Iterator for PreorderWithTokens {
-  type Item = WalkEvent<SyntaxElement>;
-
-  fn next(&mut self) -> Option<WalkEvent<SyntaxElement>> {
-    if self.skip_subtree {
-      self.do_skip();
-      self.skip_subtree = false;
-    }
-    let next = self.next.take();
-    self.next = next.as_ref().and_then(|next| {
-      Some(match next {
-        WalkEvent::Enter(el) => match el {
-          NodeOrToken::Node(node) => match node.first_child_or_token() {
-            Some(child) => WalkEvent::Enter(child),
-            None => WalkEvent::Leave(node.clone().into()),
-          },
-          NodeOrToken::Token(token) => WalkEvent::Leave(token.clone().into()),
-        },
-        WalkEvent::Leave(el) if el == &self.start => return None,
-        WalkEvent::Leave(el) => match el.next_sibling_or_token() {
-          Some(sibling) => WalkEvent::Enter(sibling),
-          None => WalkEvent::Leave(el.parent()?.into()),
-        },
-      })
-    });
-    next
-  }
-}
-// endregion
-
 #[cfg(test)]
 mod tests {
+  use std::hash::Hash;
+  use std::iter;
+
   use strict_test_support::TestFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_ne;
+  use strict_test_support::ensure_ok;
   use strict_test_support::ensure_some;
 
+  use super::RangeError;
   use super::SyntaxElement;
   use super::SyntaxNode;
   use super::SyntaxToken;
+  use super::query_selects_child;
+  use crate::Direction;
+  use crate::GreenElement;
+  use crate::GreenError;
   use crate::GreenNode;
   use crate::GreenToken;
   use crate::NodeOrToken;
   use crate::SyntaxKind;
+  use crate::TextRange;
+  use crate::TextSize;
+  use crate::TokenAtOffset;
+  use crate::test_support::ensure_one_word;
+  use crate::test_support::ensure_same_hash;
+  use crate::test_support::event_trace;
 
-  fn mutable_token_root(texts: &[&str]) -> SyntaxNode {
-    let children = texts.iter().map(|text| GreenToken::new(SyntaxKind(1), text).into());
-    SyntaxNode::new_root_mut(GreenNode::new(SyntaxKind(0), children))
+  /// Build a token fixture.
+  fn token(kind: u16, text: &str) -> Result<GreenToken, TestFailure> {
+    ensure_ok(GreenToken::new(SyntaxKind(kind), text), "the cursor token fixture must allocate")
   }
 
-  fn next_token(children: &mut impl Iterator<Item = SyntaxElement>, context: &'static str) -> Result<SyntaxToken, TestFailure> {
-    ensure_some(children.next().and_then(NodeOrToken::into_token), context)
+  /// Build a node fixture.
+  fn node(kind: u16, children: impl IntoIterator<Item = GreenElement>) -> Result<GreenNode, TestFailure> {
+    ensure_ok(GreenNode::new(SyntaxKind(kind), children), "the cursor node fixture must allocate")
   }
 
-  fn child_texts(root: &SyntaxNode) -> String {
-    root
-      .children_with_tokens()
-      .map(|child| match child {
-        NodeOrToken::Node(node) => node.to_string(),
-        NodeOrToken::Token(token) => token.text().to_owned(),
-      })
-      .collect::<Vec<_>>()
-      .join("|")
+  /// Build the shared mixed tree used by cursor behavior tests.
+  fn mixed_tree() -> Result<SyntaxNode, TestFailure> {
+    let empty = node(4, std::iter::empty())?;
+    let branch = node(2, [
+      GreenElement::from(token(3, "β")?),
+      GreenElement::from(empty.clone()),
+      GreenElement::from(empty),
+      GreenElement::from(token(1, "c")?),
+    ])?;
+    let root = node(0, [
+      GreenElement::from(token(1, "a")?),
+      GreenElement::from(branch),
+      GreenElement::from(token(1, "d")?),
+    ])?;
+    Ok(SyntaxNode::new_root(root))
+  }
+
+  /// Return source-order kind labels for elements.
+  fn element_kinds(elements: impl IntoIterator<Item = SyntaxElement>) -> Vec<SyntaxKind> {
+    elements.into_iter().map(|element| element.kind()).collect()
   }
 
   #[test]
-  fn splice_children_reparents_insertions_and_reindexes_live_siblings() -> Result<(), TestFailure> {
-    let root = mutable_token_root(&["a", "b", "c"]);
-    let mut original_children = root.children_with_tokens();
-    let _a = next_token(&mut original_children, "the original root must contain token a")?;
-    let b = next_token(&mut original_children, "the original root must contain token b")?;
-    let c = next_token(&mut original_children, "the original root must contain token c")?;
+  fn raw_navigation_preserves_order_in_both_directions() -> Result<(), TestFailure> {
+    let root = mixed_tree()?;
+    let branch = ensure_some(root.first_child(), "the root must contain its branch node")?;
+    ensure(branch.kind() == SyntaxKind(2), "node-only navigation must skip the first token")?;
+    ensure(
+      ensure_some(root.last_child(), "the root must have a last child node")?.kind() == SyntaxKind(2),
+      "the branch must be both the first and last direct node",
+    )?;
+    ensure(
+      root.first_child_by_kind(&|kind| kind == SyntaxKind(9)).is_none(),
+      "a matcher miss must return None",
+    )?;
+    ensure(
+      ensure_some(
+        root.first_child_by_kind(&|kind| kind == SyntaxKind(2)),
+        "the matcher must find the branch",
+      )?
+      .kind()
+        == SyntaxKind(2),
+      "a matcher hit must preserve the matched node",
+    )?;
 
-    let detached_root = mutable_token_root(&["x", "y"]);
-    let mut detached_children = detached_root.children_with_tokens();
-    let x = next_token(&mut detached_children, "the insertion root must contain token x")?;
-    let y = next_token(&mut detached_children, "the insertion root must contain token y")?;
+    let direct = element_kinds(root.children_with_tokens());
+    ensure(
+      direct == vec![SyntaxKind(1), SyntaxKind(2), SyntaxKind(1)],
+      "direct element iteration must preserve token-node-token order",
+    )?;
+    let first = ensure_some(root.first_child_or_token(), "the root must have a first element")?;
+    let forward = element_kinds(iter::successors(Some(first), SyntaxElement::next_sibling_or_token));
+    ensure(forward == direct, "forward sibling iteration must include the starting element")?;
+    let last = ensure_some(root.last_child_or_token(), "the root must have a final element")?;
+    let reverse = element_kinds(iter::successors(Some(last), SyntaxElement::prev_sibling_or_token));
+    ensure(
+      reverse == vec![SyntaxKind(1), SyntaxKind(2), SyntaxKind(1)],
+      "reverse sibling iteration must retain reverse source positions even when kinds repeat",
+    )?;
 
-    root.splice_children(1..2, [x.clone().into(), y.clone().into()]);
+    let branch_elements = branch.children_with_tokens().collect::<Vec<_>>();
+    ensure_eq(&branch_elements.len(), &4, "the branch must expose both repeated empty nodes")?;
+    let beta = ensure_some(
+      branch_elements.first().cloned().and_then(NodeOrToken::into_token),
+      "the branch must begin with beta",
+    )?;
+    let c = ensure_some(
+      branch_elements.last().cloned().and_then(NodeOrToken::into_token),
+      "the branch must end with c",
+    )?;
+    ensure_eq(
+      &ensure_some(beta.next_token(), "beta must have a next token")?.text(),
+      &"c",
+      "next_token must cross zero-width nodes",
+    )?;
+    ensure_eq(
+      &ensure_some(c.prev_token(), "c must have a previous token")?.text(),
+      &"β",
+      "prev_token must cross zero-width nodes",
+    )?;
+    ensure_eq(
+      &ensure_some(c.next_token(), "c must advance out of its branch")?.text(),
+      &"d",
+      "next_token must cross an ancestor boundary",
+    )?;
+    ensure_eq(
+      &ensure_some(beta.prev_token(), "beta must retreat out of its branch")?.text(),
+      &"a",
+      "prev_token must cross an ancestor boundary",
+    )?;
+    ensure_eq(&branch.ancestors().count(), &2, "branch ancestors must include branch and root")?;
+    ensure(
+      root.descendants().map(|node| node.kind()).collect::<Vec<_>>() == vec![SyntaxKind(0), SyntaxKind(2), SyntaxKind(4), SyntaxKind(4)],
+      "node descendants must use preorder and omit tokens",
+    )?;
+    ensure(
+      element_kinds(root.descendants_with_tokens())
+        == vec![
+          SyntaxKind(0),
+          SyntaxKind(1),
+          SyntaxKind(2),
+          SyntaxKind(3),
+          SyntaxKind(4),
+          SyntaxKind(4),
+          SyntaxKind(1),
+          SyntaxKind(1),
+        ],
+      "element descendants must preserve complete preorder",
+    )
+  }
 
+  /// Extract token text from a token-at-offset result.
+  fn touching_texts(result: TokenAtOffset<SyntaxToken>) -> Vec<String> {
+    result.map(|token| token.text().to_owned()).collect()
+  }
+
+  #[test]
+  fn range_queries_enforce_closed_offsets_and_fixed_boundary_bias() -> Result<(), TestFailure> {
+    let root = mixed_tree()?;
+    ensure(
+      touching_texts(ensure_ok(
+        root.token_at_offset(TextSize::from(0)),
+        "the start offset must be valid",
+      )?)
+        == vec!["a".to_owned()],
+      "the start offset must touch only the first token",
+    )?;
+    ensure(
+      touching_texts(ensure_ok(
+        root.token_at_offset(TextSize::from(1)),
+        "the first boundary must be valid",
+      )?)
+        == vec!["a".to_owned(), "β".to_owned()],
+      "an inter-token boundary must return left then right",
+    )?;
+    ensure(
+      touching_texts(ensure_ok(
+        root.token_at_offset(TextSize::from(3)),
+        "the inner boundary must be valid",
+      )?)
+        == vec!["β".to_owned(), "c".to_owned()],
+      "zero-width nodes must not displace adjacent non-empty tokens",
+    )?;
+    ensure(
+      touching_texts(ensure_ok(root.token_at_offset(TextSize::from(5)), "the end offset must be valid")?) == vec!["d".to_owned()],
+      "the closed end offset must touch the final token",
+    )?;
+    ensure(
+      root.token_at_offset(TextSize::from(6))
+        == Err(RangeError::OffsetOutOfBounds {
+          offset: TextSize::from(6),
+          valid:  TextRange::new(TextSize::from(0), TextSize::from(5)),
+        }),
+      "an offset beyond the closed interval must be rejected",
+    )?;
+
+    let right_biased = ensure_some(
+      ensure_ok(
+        root.child_or_token_at_range(TextRange::empty(TextSize::from(1))),
+        "the internal empty range must be valid",
+      )?,
+      "the internal empty range must select a direct child",
+    )?;
+    ensure(
+      right_biased.kind() == SyntaxKind(2),
+      "an internal empty range must prefer the right child",
+    )?;
+    let end_biased = ensure_some(
+      ensure_ok(
+        root.child_or_token_at_range(TextRange::empty(TextSize::from(5))),
+        "the end empty range must be valid",
+      )?,
+      "the end empty range must select the final child",
+    )?;
+    ensure(end_biased.kind() == SyntaxKind(1), "the container end must select its final child")?;
+    ensure(
+      ensure_ok(
+        root.child_or_token_at_range(TextRange::new(TextSize::from(0), TextSize::from(2))),
+        "the spanning range must still be valid",
+      )?
+      .is_none(),
+      "a range spanning direct children must return None",
+    )?;
+    let covered = ensure_ok(
+      root.covering_element(TextRange::new(TextSize::from(1), TextSize::from(3))),
+      "the beta range must be coverable",
+    )?;
+    ensure(
+      covered.kind() == SyntaxKind(3),
+      "covering_element must descend to the containing token",
+    )?;
+    ensure(
+      root.child_or_token_at_range(TextRange::new(TextSize::from(0), TextSize::from(6)))
+        == Err(RangeError::RangeOutOfBounds {
+          requested: TextRange::new(TextSize::from(0), TextSize::from(6)),
+          valid:     root.text_range(),
+        }),
+      "out-of-bounds ranges must be rejected",
+    )?;
+
+    let empty = SyntaxNode::new_root(node(8, std::iter::empty())?);
+    ensure(
+      ensure_ok(
+        empty.token_at_offset(TextSize::from(0)),
+        "an empty root's sole offset must be valid",
+      )? == TokenAtOffset::None,
+      "an empty root must not invent a token",
+    )
+  }
+
+  #[test]
+  fn cursor_identity_uses_green_allocation_and_absolute_offset() -> Result<(), TestFailure> {
+    let root = mixed_tree()?;
+    let reconstructed = SyntaxNode::new_root(root.green().clone());
+    let separate = SyntaxNode::new_root(node(0, [
+      GreenElement::from(token(1, "a")?),
+      GreenElement::from(node(2, [
+        GreenElement::from(token(3, "β")?),
+        GreenElement::from(node(4, std::iter::empty())?),
+        GreenElement::from(node(4, std::iter::empty())?),
+        GreenElement::from(token(1, "c")?),
+      ])?),
+      GreenElement::from(token(1, "d")?),
+    ])?);
+    ensure_eq(
+      &root,
+      &reconstructed,
+      "reconstruction from the same green root must preserve cursor identity",
+    )?;
+    ensure_ne(
+      &root,
+      &separate,
+      "a structurally equal but separate green root must have different cursor identity",
+    )?;
+
+    let branch = ensure_some(root.first_child(), "the branch must exist")?;
+    let empties = branch.children().collect::<Vec<_>>();
+    let first_empty = ensure_some(empties.first(), "the first empty node must exist")?;
+    let second_empty = ensure_some(empties.get(1), "the second empty node must exist")?;
+    ensure_eq(
+      first_empty,
+      second_empty,
+      "repeated zero-width nodes with shared green allocation and offset intentionally share public cursor identity",
+    )?;
+
+    let shared_token = token(1, "x")?;
+    let repeated = SyntaxNode::new_root(node(9, [
+      GreenElement::from(shared_token.clone()),
+      GreenElement::from(shared_token),
+    ])?);
+    let repeated_tokens = repeated
+      .children_with_tokens()
+      .filter_map(NodeOrToken::into_token)
+      .collect::<Vec<_>>();
+    ensure_ne(
+      ensure_some(repeated_tokens.first(), "the first repeated token must exist")?,
+      ensure_some(repeated_tokens.get(1), "the second repeated token must exist")?,
+      "the same token allocation at different absolute offsets must have different cursor identity",
+    )?;
+
+    ensure_same_hash(
+      &root,
+      &reconstructed,
+      Hash::hash,
+      "equal cursors must produce equal identity hashes",
+    )
+  }
+
+  /// Assert thread-transfer traits through a generic bound.
+  fn send_sync<Value: Send + Sync>() {}
+
+  #[test]
+  fn raw_cursor_handles_are_one_word_send_and_sync() -> Result<(), TestFailure> {
+    send_sync::<SyntaxNode>();
+    send_sync::<SyntaxToken>();
+    ensure_one_word::<SyntaxNode>("a raw syntax node must remain one machine word")?;
+    ensure_one_word::<SyntaxToken>("a raw syntax token must remain one machine word")
+  }
+
+  #[test]
+  fn functional_replacement_rebuilds_only_the_ancestor_spine() -> Result<(), TestFailure> {
+    let root = mixed_tree()?;
+    let branch = ensure_some(root.first_child(), "the replaceable branch must exist")?;
+    let replacement_branch = node(2, [GreenElement::from(token(3, "z")?)])?;
+    let rebuilt = ensure_ok(
+      branch.replace_with(replacement_branch.clone()),
+      "a same-kind node replacement must rebuild the root",
+    )?;
+    ensure_eq(
+      &rebuilt.to_string(),
+      &"azd".to_owned(),
+      "node replacement must preserve the unaffected context",
+    )?;
+    ensure(
+      ensure_some(rebuilt.children().next(), "the rebuilt root's first child must exist")?
+        .to_owned()
+        .ptr_eq(&GreenElement::from(token_from_root(&root, "a")?.green().clone())),
+      "the unchanged prefix token must retain allocation identity",
+    )?;
     ensure_eq(
       &root.to_string(),
-      &"axyc".to_owned(),
-      "replacement text must preserve insertion order",
-    )?;
-    ensure(b.parent().is_none(), "the replaced token must be detached")?;
-    ensure(
-      ensure_some(x.parent(), "inserted token x must have a parent")? == root,
-      "inserted token x must be parented by the original root",
+      &"aβcd".to_owned(),
+      "replacement must leave the immutable source unchanged",
     )?;
     ensure(
-      ensure_some(y.parent(), "inserted token y must have a parent")? == root,
-      "inserted token y must be parented by the original root",
+      branch.replace_with(node(9, std::iter::empty())?)
+        == Err(GreenError::KindMismatch {
+          expected: SyntaxKind(2),
+          actual:   SyntaxKind(9),
+        }),
+      "a node kind mismatch must fail before ancestor rebuilding",
     )?;
-    ensure_eq(&x.index(), &1, "inserted token x must occupy index one")?;
-    ensure_eq(&y.index(), &2, "inserted token y must occupy index two")?;
-    ensure(
-      ensure_some(c.parent(), "the live trailing token must remain attached")? == root,
-      "the live trailing token must remain parented by the original root",
+
+    let c = token_from_root(&root, "c")?;
+    let replaced_token_root = ensure_ok(
+      c.replace_with(token(1, "C")?),
+      "a same-kind token replacement must rebuild every ancestor",
     )?;
-    ensure_eq(&c.index(), &3, "the live trailing token must be reindexed")?;
     ensure_eq(
-      &child_texts(&root),
-      &"a|x|y|c".to_owned(),
-      "children_with_tokens must expose the replacement source order",
+      &replaced_token_root.to_string(),
+      &"aβCd".to_owned(),
+      "token replacement must preserve all unaffected source text",
+    )?;
+    ensure(
+      c.replace_with(token(9, "C")?)
+        == Err(GreenError::KindMismatch {
+          expected: SyntaxKind(1),
+          actual:   SyntaxKind(9),
+        }),
+      "a token kind mismatch must fail before ancestor rebuilding",
+    )
+  }
+
+  /// Find a token with exact text in one cursor tree.
+  fn token_from_root(root: &SyntaxNode, text: &str) -> Result<SyntaxToken, TestFailure> {
+    ensure_some(
+      root
+        .descendants_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .find(|token| token.text() == text),
+      "the requested token fixture must exist",
     )
   }
 
   #[test]
-  fn splice_children_detaches_deleted_children_without_replacement() -> Result<(), TestFailure> {
-    let root = mutable_token_root(&["a", "b", "c"]);
-    let mut children = root.children_with_tokens();
-    let a = next_token(&mut children, "the root must contain token a")?;
-    let b = next_token(&mut children, "the root must contain token b")?;
-    let c = next_token(&mut children, "the root must contain token c")?;
-
-    root.splice_children(1..3, std::iter::empty::<SyntaxElement>());
-
-    ensure_eq(&root.to_string(), &"a".to_owned(), "deletion must retain only the unaffected token")?;
-    ensure(b.parent().is_none(), "the first deleted token must be detached")?;
-    ensure(c.parent().is_none(), "the second deleted token must be detached")?;
+  fn preorder_emits_balanced_enter_leave_events() -> Result<(), TestFailure> {
+    let root = mixed_tree()?;
+    let events = event_trace(root.preorder(), |node| node.kind());
     ensure(
-      ensure_some(a.parent(), "the unaffected token must remain attached")? == root,
-      "the unaffected token must remain parented by the original root",
-    )?;
-    ensure_eq(&a.index(), &0, "the unaffected token must remain at index zero")?;
-    ensure_eq(
-      &child_texts(&root),
-      &"a".to_owned(),
-      "deletion without replacement must not create phantom children",
+      events
+        == vec![
+          (true, SyntaxKind(0)),
+          (true, SyntaxKind(2)),
+          (true, SyntaxKind(4)),
+          (false, SyntaxKind(4)),
+          (true, SyntaxKind(4)),
+          (false, SyntaxKind(4)),
+          (false, SyntaxKind(2)),
+          (false, SyntaxKind(0)),
+        ],
+      "node preorder must emit every balanced event in source order",
     )
+  }
+
+  /// Raw cursor fixture spanning node/token sibling boundaries.
+  struct RawFixture {
+    /// Root cursor.
+    root:      SyntaxNode,
+    /// First direct child node.
+    left:      SyntaxNode,
+    /// Last direct child node.
+    right:     SyntaxNode,
+    /// Intervening separator token.
+    separator: SyntaxToken,
+  }
+
+  /// Build the shared raw cursor fixture.
+  fn raw_fixture() -> Result<RawFixture, TestFailure> {
+    let left_green = node(2, [GreenElement::from(token(1, "left")?)])?;
+    let right_green = node(3, std::iter::empty())?;
+    let root_green = node(0, [
+      GreenElement::from(left_green),
+      GreenElement::from(token(4, ":")?),
+      GreenElement::from(right_green),
+      GreenElement::from(token(5, "tail")?),
+    ])?;
+    let root = SyntaxNode::new_root(root_green);
+    let left = ensure_some(root.first_child(), "the left child node must exist")?;
+    let right = ensure_some(root.last_child(), "the right child node must exist")?;
+    let separator = ensure_some(
+      root
+        .first_child_or_token_by_kind(&|kind| kind == SyntaxKind(4))
+        .and_then(NodeOrToken::into_token),
+      "the direct-element matcher must find the separator token",
+    )?;
+    Ok(RawFixture {
+      root,
+      left,
+      right,
+      separator,
+    })
+  }
+
+  #[test]
+  fn raw_node_sibling_navigation_covers_both_directions_and_misses() -> Result<(), TestFailure> {
+    let RawFixture {
+      left,
+      right,
+      ..
+    } = raw_fixture()?;
+    ensure(
+      ensure_some(left.next_sibling(), "the left node must have a later node sibling")? == right,
+      "next_sibling must skip the intervening token",
+    )?;
+    ensure(
+      ensure_some(right.prev_sibling(), "the right node must have an earlier node sibling")? == left,
+      "prev_sibling must skip the intervening token",
+    )?;
+    ensure(left.prev_sibling().is_none(), "the first node sibling must have no previous node")?;
+    ensure(right.next_sibling().is_none(), "the last node sibling must have no next node")?;
+    ensure(
+      left.next_sibling_by_kind(&|kind| kind == SyntaxKind(3)) == Some(right.clone()),
+      "kind-filtered node navigation must find a later matching sibling",
+    )?;
+    ensure(
+      left.next_sibling_by_kind(&|kind| kind == SyntaxKind(9)).is_none(),
+      "kind-filtered node navigation must return None on a miss",
+    )?;
+    ensure(
+      left.siblings(Direction::Next).map(|node| node.kind()).collect::<Vec<_>>() == vec![SyntaxKind(2), SyntaxKind(3)],
+      "forward node siblings must include the starting node and skip tokens",
+    )?;
+    ensure(
+      right.siblings(Direction::Prev).map(|node| node.kind()).collect::<Vec<_>>() == vec![SyntaxKind(3), SyntaxKind(2)],
+      "reverse node siblings must include the starting node in reverse order",
+    )
+  }
+
+  #[test]
+  fn raw_element_sibling_navigation_crosses_variants_and_preserves_order() -> Result<(), TestFailure> {
+    let RawFixture {
+      root,
+      left,
+      right,
+      separator,
+    } = raw_fixture()?;
+    ensure(
+      root.first_child_or_token_by_kind(&|kind| kind == SyntaxKind(9)).is_none(),
+      "the direct-element matcher must return None on a miss",
+    )?;
+    ensure(
+      left.next_sibling_or_token_by_kind(&|kind| kind == SyntaxKind(3)) == Some(SyntaxElement::from(right.clone())),
+      "node element navigation must skip to a later matching variant",
+    )?;
+    ensure(
+      separator.next_sibling_or_token_by_kind(&|kind| kind == SyntaxKind(5)).is_some(),
+      "token element navigation must find a later matching sibling",
+    )?;
+    ensure(
+      separator.next_sibling_or_token_by_kind(&|kind| kind == SyntaxKind(9)).is_none(),
+      "token element navigation must return None on a miss",
+    )?;
+    ensure(
+      separator
+        .siblings_with_tokens(Direction::Prev)
+        .map(|element| element.kind())
+        .collect::<Vec<_>>()
+        == vec![SyntaxKind(4), SyntaxKind(2)],
+      "reverse token siblings must preserve direct reverse source order",
+    )?;
+    ensure(
+      left
+        .siblings_with_tokens(Direction::Next)
+        .map(|element| element.kind())
+        .collect::<Vec<_>>()
+        == vec![SyntaxKind(2), SyntaxKind(4), SyntaxKind(3), SyntaxKind(5)],
+      "forward node element siblings must cross variants in source order",
+    )
+  }
+
+  #[test]
+  fn raw_element_metadata_and_boundaries_preserve_variant_contracts() -> Result<(), TestFailure> {
+    let RawFixture {
+      root,
+      left,
+      separator,
+      ..
+    } = raw_fixture()?;
+    let node_element = SyntaxElement::from(left.clone());
+    let token_element = SyntaxElement::from(separator.clone());
+    ensure(node_element.index() == 0, "node elements must expose their parent index")?;
+    ensure(token_element.index() == 1, "token elements must expose their parent index")?;
+    ensure(
+      node_element.text_range() == left.text_range(),
+      "node elements must preserve node ranges",
+    )?;
+    ensure(
+      token_element.text_range() == separator.text_range(),
+      "token elements must preserve token ranges",
+    )?;
+    ensure(
+      node_element.parent() == Some(root.clone()),
+      "node elements must preserve their parent",
+    )?;
+    ensure(
+      token_element.parent() == Some(root.clone()),
+      "token elements must preserve their parent",
+    )?;
+    ensure_eq(
+      &node_element.ancestors().count(),
+      &2,
+      "node-element ancestors must begin with the node itself",
+    )?;
+    ensure_eq(
+      &token_element.ancestors().count(),
+      &1,
+      "token-element ancestors must begin with the token parent",
+    )?;
+    ensure(
+      ensure_some(node_element.first_token(), "the left node element must have a first token")?.text() == "left",
+      "node-element first_token must descend into the node",
+    )?;
+    ensure(
+      ensure_some(node_element.last_token(), "the left node element must have a last token")?.text() == "left",
+      "node-element last_token must descend into the node",
+    )?;
+    ensure(
+      (token_element.first_token(), token_element.last_token()) == (Some(separator.clone()), Some(separator.clone())),
+      "token elements must return themselves as both boundary tokens",
+    )?;
+    ensure(
+      token_element
+        .green_owned()
+        .ptr_eq(&GreenElement::from(separator.green().clone())),
+      "token-element green cloning must preserve allocation identity",
+    )?;
+    ensure(
+      node_element.green_owned().ptr_eq(&GreenElement::from(left.green().clone())),
+      "node-element green cloning must preserve allocation identity",
+    )?;
+    ensure(
+      token_element
+        .next_sibling_or_token_by_kind(&|kind| kind == SyntaxKind(3))
+        .is_some(),
+      "element-level matching must delegate across the token-to-node boundary",
+    )?;
+    ensure(
+      node_element.prev_sibling_or_token().is_none(),
+      "the first node element must have no previous direct element",
+    )
+  }
+
+  #[test]
+  fn raw_cursor_formatting_hashing_and_empty_navigation_are_total() -> Result<(), TestFailure> {
+    let RawFixture {
+      root,
+      separator,
+      ..
+    } = raw_fixture()?;
+    ensure_eq(
+      &separator.to_string(),
+      &":".to_owned(),
+      "raw token display must preserve exact text",
+    )?;
+    ensure(
+      format!("{separator:?}").contains("SyntaxToken"),
+      "raw token debug output must expose token metadata",
+    )?;
+    ensure(
+      format!("{root:?}").contains("SyntaxNode"),
+      "raw node debug output must expose node metadata",
+    )?;
+    let reconstructed_separator = ensure_some(
+      SyntaxNode::new_root(root.green().clone())
+        .children_with_tokens()
+        .find_map(NodeOrToken::into_token),
+      "the reconstructed separator token must exist",
+    )?;
+    ensure_same_hash(
+      &separator,
+      &reconstructed_separator,
+      Hash::hash,
+      "equal token cursors reconstructed from the same green root must hash equally",
+    )?;
+
+    let empty = SyntaxNode::new_root(node(8, std::iter::empty())?);
+    ensure(empty.first_child().is_none(), "an empty node must have no first child node")?;
+    ensure(empty.last_child().is_none(), "an empty node must have no last child node")?;
+    ensure(empty.first_child_or_token().is_none(), "an empty node must have no first element")?;
+    ensure(empty.last_child_or_token().is_none(), "an empty node must have no last element")?;
+    ensure(empty.first_token().is_none(), "an empty node must have no first token")?;
+    ensure(empty.last_token().is_none(), "an empty node must have no last token")
+  }
+
+  #[test]
+  fn replacing_a_root_reuses_the_validated_replacement_without_an_ancestor_spine() -> Result<(), TestFailure> {
+    let source = SyntaxNode::new_root(node(7, [GreenElement::from(token(1, "old")?)])?);
+    let replacement = node(7, [GreenElement::from(token(1, "new")?)])?;
+    let rebuilt = ensure_ok(
+      source.replace_with(replacement.clone()),
+      "a same-kind root replacement must succeed without requiring a parent",
+    )?;
+    ensure(
+      rebuilt.ptr_eq(&replacement),
+      "root replacement must return the validated replacement allocation directly",
+    )?;
+    ensure_eq(
+      &rebuilt.to_string(),
+      &"new".to_owned(),
+      "root replacement must preserve replacement text",
+    )?;
+    ensure_eq(
+      &source.to_string(),
+      &"old".to_owned(),
+      "root replacement must leave the immutable source reusable",
+    )
+  }
+
+  #[test]
+  fn zero_width_tokens_and_consuming_navigation_preserve_boundary_identity() -> Result<(), TestFailure> {
+    let root = SyntaxNode::new_root(node(0, [
+      GreenElement::from(token(1, "")?),
+      GreenElement::from(token(1, "a")?),
+      GreenElement::from(token(1, "b")?),
+    ])?);
+    let first = ensure_some(root.first_child_or_token(), "the zero-width leading token must exist")?;
+    let second = ensure_some(
+      first.into_next_sibling_or_token(),
+      "consuming navigation must advance from the zero-width token",
+    )?;
+    let second_range = second.text_range();
+    let second_index = second.index();
+    let third = ensure_some(
+      second.into_next_sibling_or_token(),
+      "consuming navigation must advance between non-empty tokens",
+    )?;
+
+    let touching_start = touching_texts(ensure_ok(
+      root.token_at_offset(TextSize::default()),
+      "the root start must remain a valid closed-boundary query",
+    )?);
+    let touching_end = touching_texts(ensure_ok(
+      root.token_at_offset(TextSize::from(2)),
+      "the root end must remain a valid closed-boundary query",
+    )?);
+    let spanning = ensure_ok(
+      root.covering_element(TextRange::new(TextSize::default(), TextSize::from(2))),
+      "a range spanning both non-empty tokens must remain valid",
+    )?;
+    let outside = root.covering_element(TextRange::new(TextSize::default(), TextSize::from(3)));
+    let selection_polarities = [
+      query_selects_child(
+        TextRange::new(TextSize::from(1), TextSize::from(3)),
+        TextRange::empty(TextSize::from(1)),
+      ),
+      query_selects_child(
+        TextRange::new(TextSize::from(5), TextSize::from(7)),
+        TextRange::empty(TextSize::from(4)),
+      ),
+      query_selects_child(
+        TextRange::new(TextSize::from(1), TextSize::from(5)),
+        TextRange::empty(TextSize::from(3)),
+      ),
+      query_selects_child(
+        TextRange::new(TextSize::from(1), TextSize::from(3)),
+        TextRange::empty(TextSize::from(3)),
+      ),
+    ];
+
+    let distinct_root = SyntaxNode::new_root(node(0, [GreenElement::from(token(1, "")?)])?);
+    let distinct = ensure_some(distinct_root.first_token(), "the separately allocated zero-width token must exist")?;
+    let original = ensure_some(root.first_token(), "the original zero-width token must remain reachable")?;
+
+    ensure(
+      (
+        second_range,
+        second_index,
+        third.text_range(),
+        third.index(),
+        touching_start,
+        touching_end,
+        original == distinct,
+        spanning.kind(),
+        outside,
+        selection_polarities,
+      ) == (
+        TextRange::new(TextSize::default(), TextSize::from(1)),
+        1,
+        TextRange::new(TextSize::from(1), TextSize::from(2)),
+        2,
+        vec!["a".to_owned()],
+        vec!["b".to_owned()],
+        false,
+        SyntaxKind(0),
+        Err(RangeError::RangeOutOfBounds {
+          requested: TextRange::new(TextSize::default(), TextSize::from(3)),
+          valid:     TextRange::new(TextSize::default(), TextSize::from(2)),
+        }),
+        [true, false, true, false],
+      ),
+      "zero-width filtering, consuming reuse, closed boundaries, and token allocation identity must remain independent",
+    )
+  }
+
+  #[test]
+  fn deep_cursor_traversal_and_formatting_do_not_recurse() -> Result<(), TestFailure> {
+    let mut green = node(7, [GreenElement::from(token(1, "x")?)])?;
+    for _ in 0..4_096 {
+      green = node(7, [GreenElement::from(green)])?;
+    }
+    let root = SyntaxNode::new_root(green);
+    ensure_eq(
+      &root.descendants().count(),
+      &4_097,
+      "deep node traversal must visit every nested node",
+    )?;
+    ensure_eq(
+      &root.to_string(),
+      &"x".to_owned(),
+      "deep cursor display must reach the token iteratively",
+    )?;
+    let leaf = ensure_some(root.first_token(), "the deep leaf token must be reachable")?;
+    drop(root);
+    drop(leaf);
+    Ok(())
   }
 }

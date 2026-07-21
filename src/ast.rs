@@ -1,244 +1,264 @@
-//! Working with abstract syntax trees.
-//!
-//! In rowan, syntax trees are transient objects. That means that we create
-//! trees when we need them, and tear them down to save memory. In this
-//! architecture, hanging on to a particular syntax node for a long time is
-//! ill-advisable, as that keeps the whole tree resident.
-//!
-//! Instead, we provide a [`SyntaxNodePtr`] type, which stores information about
-//! the _location_ of a particular syntax node in a tree. It's a small type
-//! which can be cheaply stored, and which can be resolved to a real
-//! [`SyntaxNode`] when necessary.
-//!
-//! We also provide an [`AstNode`] trait for typed AST wrapper APIs over rowan
-//! nodes.
+//! Typed AST wrappers and source-location pointers.
 
 use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::iter::successors;
 use std::marker::PhantomData;
 
+use thiserror::Error;
+
+use crate::GreenNode;
 use crate::Language;
+use crate::NodeOrToken;
+use crate::SyntaxKind;
 use crate::SyntaxNode;
 use crate::SyntaxNodeChildren;
 use crate::TextRange;
 
-/// The main trait to go from untyped [`SyntaxNode`] to a typed AST. The
-/// conversion itself has zero runtime cost: AST and syntax nodes have exactly
-/// the same representation: a pointer to the tree root and a pointer to the
-/// node itself.
+/// Failure to resolve a source pointer against a purported tree root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ResolveError {
+  /// The supplied cursor has a parent and therefore is not a tree root.
+  #[error("pointer resolution requires a root node")]
+  RootHasParent,
+}
+
+/// Failure in a typed AST operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AstError {
+  /// An AST implementation rejected the syntax kind produced by cloning its own syntax node.
+  #[error("AST cast rejected cloned syntax kind {kind:?}")]
+  CloneCastRejected {
+    /// Raw syntax kind rejected by the faulty cast implementation.
+    kind: SyntaxKind,
+  },
+}
+
+/// Typed AST wrapper contract over a language-specific syntax node.
 pub trait AstNode {
+  /// Language used by this AST node.
   type Language: Language;
 
+  /// Test whether this AST wrapper accepts a typed syntax kind.
   fn can_cast(kind: <Self::Language as Language>::Kind) -> bool
   where
     Self: Sized;
 
+  /// Convert a syntax node into this AST wrapper when its kind is accepted.
   fn cast(node: SyntaxNode<Self::Language>) -> Option<Self>
   where
     Self: Sized;
 
+  /// Borrow this wrapper's underlying syntax node.
   fn syntax(&self) -> &SyntaxNode<Self::Language>;
 
-  fn clone_for_update(&self) -> Self
+  /// Clone this AST subtree into an independent root cursor.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`AstError::CloneCastRejected`] when `Self::cast` rejects the kind produced from its
+  /// own source syntax.
+  fn clone_subtree(&self) -> Result<Self, AstError>
   where
     Self: Sized,
   {
-    Self::cast(self.syntax().clone_for_update()).unwrap()
-  }
-
-  fn clone_subtree(&self) -> Self
-  where
-    Self: Sized,
-  {
-    Self::cast(self.syntax().clone_subtree()).unwrap()
+    let syntax = self.syntax().clone_subtree();
+    let kind = <Self::Language as Language>::kind_to_raw(syntax.kind());
+    Self::cast(syntax).ok_or(AstError::CloneCastRejected {
+      kind,
+    })
   }
 }
 
-/// A "pointer" to a [`SyntaxNode`], via location in the source code.
-///
-/// ## Note
-/// Since the location is source code dependent, this must not be used
-/// with mutable syntax trees. Any changes made in such trees causes
-/// the pointed node's source location to change, invalidating the pointer.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+/// Stable source-kind and source-range pointer to a syntax node.
+#[derive(Clone)]
 pub struct SyntaxNodePtr<L: Language> {
-  kind:  L::Kind,
-  range: TextRange,
+  /// Typed syntax kind at pointer creation.
+  kind:   L::Kind,
+  /// Absolute source range at pointer creation.
+  range:  TextRange,
+  /// Structurally comparable source subtree used to reject non-equivalent trees.
+  source: GreenNode,
 }
 
 impl<L: Language> SyntaxNodePtr<L> {
-  /// Returns a [`SyntaxNodePtr`] for the node.
-  ///
-  /// Panics if the provided node is mutable
+  /// Create a pointer from an immutable syntax node.
   pub fn new(node: &SyntaxNode<L>) -> Self {
-    assert!(!node.is_mutable(), "tree is mutable");
     Self {
-      kind:  node.kind(),
-      range: node.text_range(),
+      kind:   node.kind(),
+      range:  node.text_range(),
+      source: node.green().clone(),
     }
   }
 
-  /// Like [`Self::try_to_node`] but panics instead of returning `None` on
-  /// failure.
-  pub fn to_node(&self, root: &SyntaxNode<L>) -> SyntaxNode<L> {
-    self
-      .try_to_node(root)
-      .unwrap_or_else(|| panic!("can't resolve {self:?} with {root:?}"))
-  }
-
-  /// "Dereferences" the pointer to get the [`SyntaxNode`] it points to.
+  /// Resolve this pointer against an equivalent tree root.
   ///
-  /// Returns `None` if the node is not found, so make sure that the `root`
-  /// syntax tree is equivalent to (i.e. is build from the same text from) the
-  /// tree which was originally used to get this [`SyntaxNodePtr`].
+  /// A valid but non-equivalent tree, wrong kind, or absent range returns `Ok(None)`.
   ///
-  /// Also returns `None` if `root` is not actually a root (i.e. it has a
-  /// parent).
+  /// # Errors
   ///
-  /// NOTE: If this function is called on a mutable tree, it will panic
-  ///
-  /// The complexity is linear in the depth of the tree and logarithmic in
-  /// tree width. As most trees are shallow, thinking about this as
-  /// `O(log(N))` in the size of the tree is not too wrong!
-  pub fn try_to_node(&self, root: &SyntaxNode<L>) -> Option<SyntaxNode<L>> {
-    assert!(!root.is_mutable(), "tree is mutable");
+  /// Returns [`ResolveError::RootHasParent`] only when `root` is not a root cursor.
+  pub fn resolve(&self, root: &SyntaxNode<L>) -> Result<Option<SyntaxNode<L>>, ResolveError> {
     if root.parent().is_some() {
-      return None;
+      return Err(ResolveError::RootHasParent);
     }
-    successors(Some(root.clone()), |node| node.child_or_token_at_range(self.range)?.into_node())
-      .find(|it| it.text_range() == self.range && it.kind() == self.kind)
+    if !root.text_range().contains_range(self.range) {
+      return Ok(None);
+    }
+    let mut current = root.clone();
+    loop {
+      if current.text_range() == self.range && current.kind() == self.kind {
+        return Ok(self.source.structurally_eq(current.green()).then_some(current));
+      }
+      current = match current.child_or_token_at_range(self.range) {
+        Ok(Some(NodeOrToken::Node(child))) => child,
+        Ok(Some(NodeOrToken::Token(_))) | Ok(None) | Err(_) => return Ok(None),
+      };
+    }
   }
 
-  /// Casts this to an [`AstPtr`] to the given node type if possible.
-  pub fn cast<N: AstNode<Language = L>>(self) -> Option<AstPtr<N>> {
-    if !N::can_cast(self.kind) {
-      return None;
-    }
-    Some(AstPtr {
+  /// Cast this pointer to a typed AST pointer when the target wrapper accepts its kind.
+  pub fn cast<NodeType: AstNode<Language = L>>(self) -> Option<AstPtr<NodeType>> {
+    NodeType::can_cast(self.kind).then_some(AstPtr {
       raw: self
     })
   }
 
-  /// Returns the kind of the syntax node this points to.
+  /// Return the typed syntax kind stored by this pointer.
   pub fn kind(&self) -> L::Kind {
     self.kind
   }
 
-  /// Returns the range of the syntax node this points to.
+  /// Return the absolute source range stored by this pointer.
   pub fn text_range(&self) -> TextRange {
     self.range
   }
 }
 
-/// Like [`SyntaxNodePtr`], but remembers the type of node.
-///
-/// ## Note
-/// As with [`SyntaxNodePtr`], this must not be used on mutable
-/// syntax trees, since any mutation can cause the pointed node's
-/// source location to change, invalidating the pointer
-pub struct AstPtr<N: AstNode> {
-  raw: SyntaxNodePtr<N::Language>,
+impl<L: Language> fmt::Debug for SyntaxNodePtr<L> {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter
+      .debug_struct("SyntaxNodePtr")
+      .field("kind", &self.kind)
+      .field("range", &self.range)
+      .finish()
+  }
 }
 
-impl<N: AstNode> AstPtr<N> {
-  /// Returns an [`AstPtr`] for the node.
-  ///
-  /// Panics if the provided node is mutable
-  pub fn new(node: &N) -> Self {
-    // The above mentioned panic is handled by SyntaxNodePtr
+impl<L: Language> PartialEq for SyntaxNodePtr<L> {
+  fn eq(&self, other: &Self) -> bool {
+    self.kind == other.kind && self.range == other.range && self.source.structurally_eq(&other.source)
+  }
+}
+
+impl<L: Language> Eq for SyntaxNodePtr<L> {}
+
+impl<L: Language> Hash for SyntaxNodePtr<L> {
+  fn hash<HasherType: Hasher>(&self, state: &mut HasherType) {
+    self.kind.hash(state);
+    self.range.hash(state);
+    self.source.hash(state);
+  }
+}
+
+/// Typed AST pointer retaining its wrapper type.
+pub struct AstPtr<NodeType: AstNode> {
+  /// Underlying syntax-node pointer.
+  raw: SyntaxNodePtr<NodeType::Language>,
+}
+
+impl<NodeType: AstNode> AstPtr<NodeType> {
+  /// Create a typed pointer from an AST node.
+  pub fn new(node: &NodeType) -> Self {
     Self {
       raw: SyntaxNodePtr::new(node.syntax()),
     }
   }
 
-  /// Like `Self::try_to_node` but panics on failure.
-  pub fn to_node(&self, root: &SyntaxNode<N::Language>) -> N {
-    self
-      .try_to_node(root)
-      .unwrap_or_else(|| panic!("can't resolve {self:?} with {root:?}"))
+  /// Resolve this pointer against an equivalent tree root.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ResolveError::RootHasParent`] only when `root` is not a root cursor.
+  pub fn resolve(&self, root: &SyntaxNode<NodeType::Language>) -> Result<Option<NodeType>, ResolveError> {
+    self.raw.resolve(root).map(|node| node.and_then(NodeType::cast))
   }
 
-  /// Given the root node containing the node `n` that `self` is a pointer to,
-  /// returns `n` if possible. Panics if `root` is mutable. See [`SyntaxNodePtr::try_to_node`].
-  pub fn try_to_node(&self, root: &SyntaxNode<N::Language>) -> Option<N> {
-    // The above mentioned panic is handled by SyntaxNodePtr
-    N::cast(self.raw.try_to_node(root)?)
+  /// Return the underlying syntax-node pointer.
+  pub fn syntax_node_ptr(&self) -> SyntaxNodePtr<NodeType::Language> {
+    self.raw.clone()
   }
 
-  /// Returns the underlying [`SyntaxNodePtr`].
-  pub fn syntax_node_ptr(&self) -> SyntaxNodePtr<N::Language> {
-    self.raw
-  }
-
-  /// Casts this to an [`AstPtr`] to the given node type if possible.
-  pub fn cast<U: AstNode<Language = N::Language>>(self) -> Option<AstPtr<U>> {
-    if !U::can_cast(self.raw.kind) {
-      return None;
-    }
-    Some(AstPtr {
+  /// Cast this pointer to another AST wrapper accepting the same stored kind.
+  pub fn cast<Other: AstNode<Language = NodeType::Language>>(self) -> Option<AstPtr<Other>> {
+    Other::can_cast(self.raw.kind).then_some(AstPtr {
       raw: self.raw
     })
   }
 }
 
-impl<N: AstNode> fmt::Debug for AstPtr<N> {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("AstPtr").field("raw", &self.raw).finish()
+impl<NodeType: AstNode> fmt::Debug for AstPtr<NodeType> {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.debug_struct("AstPtr").field("raw", &self.raw).finish()
   }
 }
 
-impl<N: AstNode> Clone for AstPtr<N> {
+impl<NodeType: AstNode> Clone for AstPtr<NodeType> {
   fn clone(&self) -> Self {
     Self {
-      raw: self.raw
+      raw: self.raw.clone()
     }
   }
 }
 
-impl<N: AstNode> PartialEq for AstPtr<N> {
-  fn eq(&self, other: &AstPtr<N>) -> bool {
+impl<NodeType: AstNode> PartialEq for AstPtr<NodeType> {
+  fn eq(&self, other: &Self) -> bool {
     self.raw == other.raw
   }
 }
 
-impl<N: AstNode> Eq for AstPtr<N> {}
+impl<NodeType: AstNode> Eq for AstPtr<NodeType> {}
 
-impl<N: AstNode> Hash for AstPtr<N> {
-  fn hash<H: Hasher>(&self, state: &mut H) {
-    self.raw.hash(state)
+impl<NodeType: AstNode> Hash for AstPtr<NodeType> {
+  fn hash<HasherType: Hasher>(&self, state: &mut HasherType) {
+    self.raw.hash(state);
   }
 }
 
-impl<N: AstNode> From<AstPtr<N>> for SyntaxNodePtr<N::Language> {
-  fn from(ptr: AstPtr<N>) -> SyntaxNodePtr<N::Language> {
-    ptr.raw
+impl<NodeType: AstNode> From<AstPtr<NodeType>> for SyntaxNodePtr<NodeType::Language> {
+  fn from(pointer: AstPtr<NodeType>) -> Self {
+    pointer.raw
   }
 }
 
+/// Iterator over direct children accepted by one AST wrapper type.
 #[derive(Debug, Clone)]
-pub struct AstChildren<N: AstNode> {
-  inner: SyntaxNodeChildren<N::Language>,
-  ph:    PhantomData<N>,
+pub struct AstChildren<NodeType: AstNode> {
+  /// Underlying typed syntax-node iterator.
+  inner:     SyntaxNodeChildren<NodeType::Language>,
+  /// AST wrapper marker.
+  node_type: PhantomData<NodeType>,
 }
 
-impl<N: AstNode> AstChildren<N> {
-  fn new(parent: &SyntaxNode<N::Language>) -> Self {
-    AstChildren {
-      inner: parent.children(),
-      ph:    PhantomData,
+impl<NodeType: AstNode> AstChildren<NodeType> {
+  /// Create a typed AST child iterator.
+  fn new(parent: &SyntaxNode<NodeType::Language>) -> Self {
+    Self {
+      inner:     parent.children(),
+      node_type: PhantomData,
     }
   }
 }
 
-impl<N: AstNode> Iterator for AstChildren<N> {
-  type Item = N;
-  fn next(&mut self) -> Option<N> {
-    self.inner.find_map(N::cast)
+impl<NodeType: AstNode> Iterator for AstChildren<NodeType> {
+  type Item = NodeType;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    self.inner.find_map(NodeType::cast)
   }
 }
 
+/// Common typed AST child and token lookup helpers.
 pub mod support {
   use super::AstChildren;
   use super::AstNode;
@@ -246,70 +266,332 @@ pub mod support {
   use crate::SyntaxNode;
   use crate::SyntaxToken;
 
-  pub fn child<N: AstNode>(parent: &SyntaxNode<N::Language>) -> Option<N> {
-    parent.children().find_map(N::cast)
+  /// Return the first direct child accepted by `NodeType`.
+  pub fn child<NodeType: AstNode>(parent: &SyntaxNode<NodeType::Language>) -> Option<NodeType> {
+    parent.children().find_map(NodeType::cast)
   }
 
-  pub fn children<N: AstNode>(parent: &SyntaxNode<N::Language>) -> AstChildren<N> {
+  /// Iterate over direct children accepted by `NodeType`.
+  pub fn children<NodeType: AstNode>(parent: &SyntaxNode<NodeType::Language>) -> AstChildren<NodeType> {
     AstChildren::new(parent)
   }
 
-  pub fn token<L: Language>(parent: &SyntaxNode<L>, kind: L::Kind) -> Option<SyntaxToken<L>> {
+  /// Return the first direct token with `kind`.
+  pub fn token<LanguageType: Language>(parent: &SyntaxNode<LanguageType>, kind: LanguageType::Kind) -> Option<SyntaxToken<LanguageType>> {
     parent
       .children_with_tokens()
-      .filter_map(|it| it.into_token())
-      .find(|it| it.kind() == kind)
+      .filter_map(|element| element.into_token())
+      .find(|token| token.kind() == kind)
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use std::collections::HashSet;
+
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_some;
+
+  use super::AstError;
+  use super::AstNode;
+  use super::AstPtr;
+  use super::ResolveError;
   use super::SyntaxNodePtr;
-  use crate::GreenNodeBuilder;
-  use crate::Language;
+  use super::support;
+  use crate::GreenElement;
+  use crate::GreenNode;
+  use crate::GreenToken;
   use crate::SyntaxKind;
   use crate::SyntaxNode;
+  use crate::test_support::TestLanguage;
+  use crate::test_support::ensure_same_hash;
+  use crate::test_support::typed_token_root;
 
-  #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-  struct TestLanguage;
-  impl Language for TestLanguage {
-    type Kind = SyntaxKind;
+  /// Consistent typed wrapper accepting one const-selected syntax kind.
+  #[derive(Clone, PartialEq, Eq)]
+  struct TestNode<const KIND: u16>(SyntaxNode<TestLanguage>);
 
-    fn kind_from_raw(raw: SyntaxKind) -> Self::Kind {
-      raw
+  impl<const KIND: u16> AstNode for TestNode<KIND> {
+    type Language = TestLanguage;
+
+    fn can_cast(kind: SyntaxKind) -> bool {
+      kind == SyntaxKind(KIND)
     }
 
-    fn kind_to_raw(kind: Self::Kind) -> SyntaxKind {
-      kind
+    fn cast(node: SyntaxNode<Self::Language>) -> Option<Self> {
+      Self::can_cast(node.kind()).then_some(Self(node))
+    }
+
+    fn syntax(&self) -> &SyntaxNode<Self::Language> {
+      &self.0
     }
   }
 
-  fn build_immut_tree() -> SyntaxNode<TestLanguage> {
-    // Creates a single-node tree
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(SyntaxKind(0));
-    builder.finish_node();
+  /// Typed wrapper accepting kind one.
+  type GoodNode = TestNode<1>;
 
-    SyntaxNode::<TestLanguage>::new_root(builder.finish())
+  /// Wrapper accepting a different kind for pointer-cast rejection coverage.
+  type OtherNode = TestNode<9>;
+
+  /// Deliberately inconsistent wrapper used to validate typed clone failure.
+  struct FaultyNode(SyntaxNode<TestLanguage>);
+
+  impl AstNode for FaultyNode {
+    type Language = TestLanguage;
+
+    fn can_cast(kind: SyntaxKind) -> bool {
+      kind == SyntaxKind(1)
+    }
+
+    fn cast(_node: SyntaxNode<Self::Language>) -> Option<Self> {
+      None
+    }
+
+    fn syntax(&self) -> &SyntaxNode<Self::Language> {
+      &self.0
+    }
+  }
+
+  /// Build a typed root with one node child containing one token.
+  fn tree(child_kind: u16, text: &str) -> Result<SyntaxNode<TestLanguage>, TestFailure> {
+    let token = ensure_ok(GreenToken::new(SyntaxKind(2), text), "the AST token fixture must allocate")?;
+    let child = ensure_ok(
+      GreenNode::new(SyntaxKind(child_kind), [GreenElement::from(token)]),
+      "the AST child fixture must allocate",
+    )?;
+    let root = ensure_ok(
+      GreenNode::new(SyntaxKind(0), [GreenElement::from(child)]),
+      "the AST root fixture must allocate",
+    )?;
+    Ok(SyntaxNode::new_root(root))
   }
 
   #[test]
-  #[should_panic = "tree is mutable"]
-  fn ensure_mut_panic_on_create() {
-    // Make a mutable version
-    let tree = build_immut_tree().clone_for_update();
+  fn syntax_pointer_resolves_only_roots_with_equivalent_subtrees() -> Result<(), TestFailure> {
+    let root = tree(1, "same")?;
+    let child = ensure_some(root.first_child(), "the source child must exist")?;
+    let pointer = SyntaxNodePtr::new(&child);
+    let resolved = ensure_some(
+      ensure_ok(pointer.resolve(&root), "the pointer must accept the correct root")?,
+      "the source pointer must resolve",
+    )?;
+    ensure_eq(&resolved, &child, "resolution must return the original location")?;
 
-    SyntaxNodePtr::new(&tree);
+    let equivalent = tree(1, "same")?;
+    ensure(
+      ensure_ok(pointer.resolve(&equivalent), "an equivalent root must be valid")?.is_some(),
+      "a separately allocated equivalent tree must resolve",
+    )?;
+    let non_equivalent = tree(1, "else")?;
+    ensure(
+      ensure_ok(pointer.resolve(&non_equivalent), "a non-equivalent root remains a valid argument")?.is_none(),
+      "same-kind and same-range but different content must not resolve",
+    )?;
+    let wrong_kind = tree(3, "same")?;
+    ensure(
+      ensure_ok(pointer.resolve(&wrong_kind), "a wrong-kind tree remains a valid argument")?.is_none(),
+      "a wrong-kind location must not resolve",
+    )?;
+    let absent_range = tree(1, "")?;
+    ensure(
+      ensure_ok(pointer.resolve(&absent_range), "a shorter tree remains a valid argument")?.is_none(),
+      "an absent source range must not resolve",
+    )?;
+    ensure(
+      pointer.resolve(&child) == Err(ResolveError::RootHasParent),
+      "a non-root argument must be rejected distinctly",
+    )
   }
 
   #[test]
-  #[should_panic = "tree is mutable"]
-  fn ensure_mut_panic_on_deref() {
-    let tree = build_immut_tree();
-    let tree_mut = tree.clone_for_update();
+  fn ast_pointer_and_clone_preserve_typed_success_and_failure() -> Result<(), TestFailure> {
+    let root = tree(1, "value")?;
+    let child = ensure_some(root.first_child(), "the typed child must exist")?;
+    let good = ensure_some(GoodNode::cast(child.clone()), "the good wrapper must accept kind one")?;
+    let pointer = AstPtr::new(&good);
+    let resolved = ensure_some(
+      ensure_ok(pointer.resolve(&root), "the typed pointer must accept the root")?,
+      "the typed pointer must resolve",
+    )?;
+    ensure_eq(resolved.syntax(), good.syntax(), "typed resolution must retain the syntax location")?;
+    let cloned = ensure_ok(good.clone_subtree(), "a consistent AST wrapper must clone")?;
+    ensure(cloned.syntax().parent().is_none(), "an AST clone must be an independent root")?;
+    ensure_eq(
+      &cloned.syntax().to_string(),
+      &"value".to_owned(),
+      "an AST clone must preserve subtree text",
+    )?;
 
-    // Create on immutable, convert on mutable
-    let syn_ptr = SyntaxNodePtr::new(&tree);
-    syn_ptr.to_node(&tree_mut);
+    let faulty = FaultyNode(child);
+    ensure(
+      faulty.clone_subtree().map(|_| ())
+        == Err(AstError::CloneCastRejected {
+          kind: SyntaxKind(1)
+        }),
+      "a faulty cast implementation must return AstError instead of panicking",
+    )?;
+    let raw_pointer = pointer.syntax_node_ptr();
+    ensure(
+      raw_pointer.kind() == SyntaxKind(1),
+      "typed pointers must expose their raw pointer kind",
+    )?;
+    ensure(
+      raw_pointer.clone().cast::<GoodNode>().is_some(),
+      "pointer casts must accept a compatible wrapper",
+    )?;
+    ensure(
+      raw_pointer.cast::<FaultyNode>().is_some(),
+      "pointer casting is governed by can_cast, independently of a faulty cast body",
+    )
+  }
+
+  #[test]
+  fn ast_support_helpers_filter_nodes_and_tokens_by_contract() -> Result<(), TestFailure> {
+    let root = tree(1, "value")?;
+    ensure(
+      support::child::<GoodNode>(&root).is_some(),
+      "the child helper must return the first accepted node",
+    )?;
+    ensure_eq(
+      &support::children::<GoodNode>(&root).count(),
+      &1,
+      "the children helper must iterate accepted direct nodes",
+    )?;
+    let child = ensure_some(root.first_child(), "the token parent must exist")?;
+    ensure(
+      support::token(&child, SyntaxKind(2)).is_some(),
+      "the token helper must find a matching direct token",
+    )?;
+    ensure(
+      support::token(&child, SyntaxKind(9)).is_none(),
+      "the token helper must return None for an absent kind",
+    )
+  }
+
+  #[test]
+  fn pointer_value_semantics_preserve_kind_range_structure_and_wrapper_type() -> Result<(), TestFailure> {
+    let root = tree(1, "value")?;
+    let child = ensure_some(root.first_child(), "the pointer source child must exist")?;
+    let pointer = SyntaxNodePtr::new(&child);
+    ensure(pointer.kind() == SyntaxKind(1), "the syntax pointer must retain its typed kind")?;
+    ensure(
+      pointer.text_range() == child.text_range(),
+      "the syntax pointer must retain its exact source range",
+    )?;
+    ensure_eq(
+      &format!("{pointer:?}"),
+      &"SyntaxNodePtr { kind: SyntaxKind(1), range: 0..5 }".to_owned(),
+      "syntax-pointer diagnostics must expose kind and range without exposing storage",
+    )?;
+    let pointer_clone = pointer.clone();
+    ensure(
+      pointer == pointer_clone,
+      "cloning a syntax pointer must preserve complete value identity",
+    )?;
+    ensure_same_hash(
+      &pointer,
+      &pointer_clone,
+      std::hash::Hash::hash,
+      "equal syntax pointers must produce equal structural hashes",
+    )?;
+    ensure(
+      pointer.clone().cast::<OtherNode>().is_none(),
+      "a syntax pointer must reject an AST wrapper that does not accept its stored kind",
+    )?;
+
+    let good = ensure_some(GoodNode::cast(child), "the pointer source must cast to GoodNode")?;
+    let typed = AstPtr::new(&good);
+    let typed_clone = typed.clone();
+    ensure(typed == typed_clone, "cloning an AST pointer must preserve wrapper-typed identity")?;
+    ensure(
+      format!("{typed:?}").contains("SyntaxNodePtr"),
+      "AST-pointer diagnostics must expose the underlying syntax pointer",
+    )?;
+    let mut pointers = HashSet::new();
+    ensure(pointers.insert(typed.clone()), "the first AST pointer must enter a hash set")?;
+    ensure(
+      !pointers.insert(typed_clone),
+      "an equal cloned AST pointer must not create a second hash-set entry",
+    )?;
+    ensure(
+      typed.clone().cast::<OtherNode>().is_none(),
+      "an AST pointer must reject an incompatible wrapper cast",
+    )?;
+    let raw_from_typed: SyntaxNodePtr<TestLanguage> = typed.into();
+    ensure(
+      raw_from_typed == pointer,
+      "converting an AST pointer back to a syntax pointer must preserve its complete value",
+    )?;
+
+    let alternate_root = typed_token_root(SyntaxKind(0), SyntaxKind(2), "value")?;
+    ensure(
+      ensure_ok(pointer.resolve(&alternate_root), "the alternate root must be a valid root")?.is_none(),
+      "resolution must reject a token where the pointer requires a structurally equivalent node",
+    )
+  }
+
+  #[test]
+  fn pointer_equality_distinguishes_kind_range_and_structural_content() -> Result<(), TestFailure> {
+    let source_root = tree(1, "value")?;
+    let source = ensure_some(source_root.first_child(), "the source pointer node must exist")?;
+    let source_pointer = SyntaxNodePtr::new(&source);
+
+    let different_kind_root = tree(9, "value")?;
+    let different_kind = ensure_some(different_kind_root.first_child(), "the alternate-kind node must exist")?;
+    let different_kind_pointer = SyntaxNodePtr::new(&different_kind);
+    let other = ensure_some(
+      OtherNode::cast(different_kind),
+      "the alternate-kind AST wrapper must accept kind nine",
+    )?;
+
+    let different_range_root = tree(1, "longer")?;
+    let different_range = ensure_some(different_range_root.first_child(), "the alternate-range node must exist")?;
+    let different_range_pointer = SyntaxNodePtr::new(&different_range);
+
+    let different_content_root = tree(1, "other")?;
+    let different_content = ensure_some(different_content_root.first_child(), "the alternate-content node must exist")?;
+    let different_content_pointer = SyntaxNodePtr::new(&different_content);
+
+    let nested = ensure_ok(
+      GreenNode::new(SyntaxKind(1), [GreenElement::from(ensure_ok(
+        GreenToken::new(SyntaxKind(2), "value"),
+        "the nested pointer token must allocate",
+      )?)]),
+      "the nested pointer node must allocate",
+    )?;
+    let nested_root = ensure_ok(
+      GreenNode::new(SyntaxKind(0), [
+        GreenElement::from(ensure_ok(
+          GreenToken::new(SyntaxKind(2), "prefix"),
+          "the nested pointer prefix must allocate",
+        )?),
+        GreenElement::from(nested),
+      ]),
+      "the nested pointer root must allocate",
+    )?;
+    let nested_root = SyntaxNode::<TestLanguage>::new_root(nested_root);
+    let nested_source = ensure_some(nested_root.last_child(), "the nested pointer node must exist after the prefix")?;
+    let nested_pointer = SyntaxNodePtr::new(&nested_source);
+    let nested_resolution = ensure_some(
+      ensure_ok(
+        nested_pointer.resolve(&nested_root),
+        "a pointer below a wider ancestor range must resolve",
+      )?,
+      "the nested pointer must descend through its ancestor",
+    )?;
+
+    ensure(
+      (
+        source_pointer == different_kind_pointer,
+        source_pointer == different_range_pointer,
+        source_pointer == different_content_pointer,
+        other.syntax().kind(),
+        nested_resolution.to_string(),
+      ) == (false, false, false, SyntaxKind(9), "value".to_owned()),
+      "syntax-pointer identity must independently include kind, range, structure, and typed wrapper access",
+    )
   }
 }
