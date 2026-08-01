@@ -8,6 +8,6 @@ use template_core::cli::command::CommandSet;
 ///
 /// Returns a typed registration error if the controlled `x` router metadata
 /// is invalid.
-pub fn commands() -> template_xtask::Result<CommandSet> {
-  template_xtask::empty_registry("strict-rowan extensions")
+pub fn commands() -> template_stask::Result<CommandSet> {
+  template_stask::empty_registry("strict-rowan extensions")
 }

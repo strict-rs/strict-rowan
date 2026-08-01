@@ -10,7 +10,7 @@ pub mod extensions;
 /// Run the guarded repository-specific extension surface.
 #[must_use]
 pub fn run() -> ExitCode {
-  template_xtask::run_with_extensions(extensions::commands())
+  template_stask::run_with_extensions(extensions::commands())
 }
 
 #[cfg(test)]
@@ -30,7 +30,7 @@ mod tests {
       descriptors.len() == 1
         && descriptors
           .first()
-          .is_some_and(|descriptor| descriptor.name() == "x" && descriptor.surface() == CommandSurface::XtaskExtension),
+          .is_some_and(|descriptor| descriptor.name() == "x" && descriptor.surface() == CommandSurface::StaskExtension),
       "the consumer runner must expose only the local x extension surface",
     )
   }

@@ -32,7 +32,7 @@ strict-test-support = { workspace = true, default-features = false }
 serde = ["dep:serde", "text-size/serde"]
 
 [workspace]
-members = [".", "xtask"]
+members = [".", "stask"]
 resolver = "3"
 
 [workspace.package]
@@ -57,14 +57,14 @@ serde = { version = "1", default-features = false }
 serde_json = { version = "1", default-features = false }
 triomphe = { version = "0.1.16", default-features = false }
 
-tracing = { version = "0.1.44", path = "../strict-tracing/tracing"}
-tracing-subscriber = { version = "0.3.23", path = "../strict-tracing/tracing-subscriber"}
+tracing = { version = "0.1.44", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
+tracing-subscriber = { version = "0.3.23", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
 
-bpaf = {  version = "0.10", default-features = false, path = "../strict-bpaf"}
-template-core = { version = "0.1.0", path = "../template-rs/crates/template-core"}
-template-xtask = { version = "0.1.0", path = "../template-rs/crates/template-xtask"}
-trybuild = {  version = "1", path = "../strict-trybuild"}
-strict-test-support = { version = "0.1.0", default-features = false, path = "../strict-test-support-rs/crates/strict-test-support"}
+bpaf = {  version = "0.10", default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
+template-core = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+template-stask = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+trybuild = {  version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict"}
+strict-test-support = { version = "0.1.0", default-features = false, git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main"}
 snapbox = { version = "1.2", features = ["diff"], default-features = false }
 anstyle = "1"
 cargo_metadata = "0.23"
@@ -72,15 +72,15 @@ globset = "0.4"
 ignore = "0.4"
 parking_lot = "0.12"
 proc-macro2 = { version = "1", features = ["span-locations"] }
-proptest = {  version = "2", features = ["std", "strict-test"], default-features = false, path = "../strict-proptest/proptest"}
+proptest = {  version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict"}
 syn = { version = "3", features = ["full", "visit"] }
-thiserror = {  version = "2", path = "../strict-thiserror" }
+thiserror = {  version = "2", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade" }
 toml = "1.1"
 toml_edit = "0.25"
 
 [patch.crates-io]
-bpaf = {  version = "0.10", path = "../strict-bpaf"}
-thiserror = {  version = "2.1.0", path = "../strict-thiserror" }
+bpaf = {  version = "0.10", git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
+thiserror = {  version = "2.1.0", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade" }
 
 # pprof = { git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "upgrade", version = "0.16" }
 # proptest = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
@@ -114,14 +114,6 @@ thiserror = {  version = "2.1.0", path = "../strict-thiserror" }
 
 
 
-
-[patch."https://github.com/strict-rs/strict-rowan"]
-rowan = { version = "0.17", path = "." }
-xtask = { path = "xtask" }
-
-[patch."https://github.com/strict-rs/strict-rowan.git"]
-rowan = { version = "0.17", path = "." }
-xtask = { path = "xtask" }
 
 # Original Taplo Release Profile
 # [profile.release]
@@ -167,12 +159,3 @@ debug            = true
 [workspace.metadata.cargo-machete]
 # Deps intentionally unused in the workspace root can be listed here.
 ignored = []
-[patch."https://github.com/earthlings-dev/template-rs.git"]
-"template-core" = {  version = "0.1.0", path = "../template-rs/crates/template-core" }
-"template-xtask" = {  version = "0.1.0", path = "../template-rs/crates/template-xtask" }
-[patch."https://github.com/strict-rs/strict-bpaf.git"]
-"bpaf" = {  version = "0.10.0", path = "../strict-bpaf" }
-[patch."https://github.com/earthlings-dev/strict-test-support-rs.git"]
-"strict-test-support" = {  version = "0.1.0", path = "../strict-test-support-rs/crates/strict-test-support" }
-[patch."https://github.com/strict-rs/strict-thiserror.git"]
-"thiserror" = {  version = "2.1.0", path = "../strict-thiserror" }
